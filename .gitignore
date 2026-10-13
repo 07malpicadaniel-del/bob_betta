@@ -1,0 +1,6 @@
+/target/
+/models/*.gguf
+/models/*.bin
+*.wal
+/llama.cpp/build/
+.DS_Store
