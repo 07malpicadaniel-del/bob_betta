@@ -2,5 +2,5 @@
 /models/*.gguf
 /models/*.bin
 *.wal
-/llama.cpp/build/
+/llama.cpp/
 .DS_Store

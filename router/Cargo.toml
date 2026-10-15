@@ -1,6 +1,13 @@
 [package]
 name = "router"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "bob_agent"
+path = "src/main.rs"
 
 [dependencies]
+vector_db = { path = "../vector_db" }
+cortex = { path = "../cortex" }
+tokio = { version = "1.40", features = ["full"] }

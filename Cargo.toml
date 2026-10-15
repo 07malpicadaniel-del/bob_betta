@@ -3,11 +3,12 @@ members = [
     "vector_db",
     "cortex",
     "router",
-    "sandbox"
+    "sandbox",
 ]
 resolver = "2"
 
-# Desactiva los símbolos de depuración en llama_cpp_sys para evitar que nvcc use '-G'
-[profile.dev.package.llama_cpp_sys]
-debug = false
-opt-level = 2
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
