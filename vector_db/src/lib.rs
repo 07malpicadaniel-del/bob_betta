@@ -163,3 +163,4 @@ impl HippocampusEngine {
         self.decay_worker.is_running.store(false, Ordering::SeqCst);
     }
 }
+pub mod causal_plane;
