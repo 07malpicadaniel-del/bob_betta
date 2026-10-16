@@ -1,3 +1,7 @@
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -7,7 +11,6 @@ use crate::ingestion::normalizer::VectorNormalizer;
 
 pub type Timestamp = u64;
 
-/// Producto punto SIMD sobre vectores de 768 dimensiones alineados a 64 bytes
 #[inline(always)]
 fn dot_product_768(a: &VectorData, b: &VectorData) -> f32 {
     let mut sum = 0.0f32;
@@ -35,25 +38,36 @@ pub struct CausalEdge {
     pub timestamp: Timestamp,
 }
 
+/// Estructura serializable en binario puro (bincode) para persistir el Plano 2 en disco
+#[derive(Serialize, Deserialize, Default)]
+struct CausalSnapshot {
+    edges: Vec<(NodeId, Vec<CausalEdge>)>,
+    validations: Vec<(NodeId, u32)>,
+}
+
 /// Plano 2: Hipergrafo Causal Dirigido + Potenciación a Largo Plazo (LTP) Lock-Free
 pub struct CausalHypergraph {
     edges: DashMap<NodeId, Vec<CausalEdge>>,
     validations: DashMap<NodeId, u32>,
     base_lambda: f32,
     alpha: f32,
+    storage_path: Option<String>,
 }
 
 impl CausalHypergraph {
-    pub fn new(base_lambda: f32, alpha: f32) -> Self {
-        Self {
+    pub fn new(base_lambda: f32, alpha: f32, storage_path: Option<&str>) -> Self {
+        let graph = Self {
             edges: DashMap::new(),
             validations: DashMap::new(),
             base_lambda,
             alpha,
-        }
+            storage_path: storage_path.map(|s| s.to_string()),
+        };
+        let _ = graph.load_from_disk();
+        graph
     }
 
-    /// Registra una arista causal dirigida (source -> target)
+    /// Registra una arista causal dirigida (source -> target) y persiste en disco
     pub fn link_nodes(
         &self,
         source_id: NodeId,
@@ -63,6 +77,9 @@ impl CausalHypergraph {
         weight: f32,
         now: Timestamp,
     ) {
+        if source_id == target_id {
+            return;
+        }
         let edge = CausalEdge {
             target_id,
             relation,
@@ -70,14 +87,22 @@ impl CausalHypergraph {
             weight,
             timestamp: now,
         };
-        self.edges.entry(source_id).or_default().push(edge);
+        let mut entry = self.edges.entry(source_id).or_default();
+        if !entry.iter().any(|e| e.target_id == target_id && e.relation == relation) {
+            entry.push(edge);
+        }
+        drop(entry);
+        let _ = self.save_to_disk();
     }
 
-    /// Incrementa las validaciones empíricas de un nodo (reduce su lambda hacia 0)
+    /// Incrementa las validaciones empíricas de un nodo (LTP: reduce su lambda hacia 0)
     pub fn record_validation(&self, node_id: NodeId) -> u32 {
         let mut count = self.validations.entry(node_id).or_insert(0);
         *count += 1;
-        *count
+        let current = *count;
+        drop(count);
+        let _ = self.save_to_disk();
+        current
     }
 
     /// Ecuación de Potenciación a Largo Plazo (Fase 3.2):
@@ -91,25 +116,96 @@ impl CausalHypergraph {
         self.base_lambda / (1.0 + self.alpha * (1.0 + n_val).ln())
     }
 
-    /// Propagación de activación O(E) sobre el Plano 2 a partir de un Nodo Semilla
-    pub fn propagate_causal_activation(&self, seed_id: NodeId, now: Timestamp) -> Vec<(CausalRelation, NodeId, String, f32)> {
+    /// Propagación de activación O(E) sobre múltiples Nodos Semilla recuperados por HNSW
+    pub fn propagate_from_seeds(
+        &self,
+        seed_ids: &[NodeId],
+        now: Timestamp,
+    ) -> Vec<(NodeId, CausalRelation, NodeId, String, f32)> {
         let mut activated = Vec::new();
-        if let Some(edge_list) = self.edges.get(&seed_id) {
-            let lambda = self.effective_lambda(seed_id, false);
-            for edge in edge_list.iter() {
-                let dt = now.saturating_sub(edge.timestamp) as f32;
-                let energy = edge.weight * (-lambda * dt).exp();
-                if energy > 0.15 {
-                    activated.push((
-                        edge.relation,
-                        edge.target_id,
-                        edge.target_summary.clone(),
-                        energy,
-                    ));
+        for &seed_id in seed_ids {
+            if let Some(edge_list) = self.edges.get(&seed_id) {
+                let lambda = self.effective_lambda(seed_id, false);
+                for edge in edge_list.iter() {
+                    let dt = now.saturating_sub(edge.timestamp) as f32;
+                    let energy = edge.weight * (-lambda * dt).exp();
+                    if energy > 0.15 {
+                        activated.push((
+                            seed_id,
+                            edge.relation,
+                            edge.target_id,
+                            edge.target_summary.clone(),
+                            energy,
+                        ));
+                    }
                 }
             }
         }
         activated
+    }
+
+    /// Extrae dinámicamente los NodeId presentes en el bloque de texto devuelto por HippocampusEngine::recall
+    pub fn extract_seed_ids(recall_context: &str) -> Vec<NodeId> {
+        let mut ids = Vec::new();
+        let marker = "Nodo ID: ";
+        let mut search_slice = recall_context;
+
+        while let Some(pos) = search_slice.find(marker) {
+            let after = &search_slice[pos + marker.len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(id) = digits.parse::<NodeId>() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            search_slice = after;
+        }
+        ids
+    }
+
+    pub fn total_edges(&self) -> usize {
+        self.edges.iter().map(|e| e.value().len()).sum()
+    }
+
+    pub fn save_to_disk(&self) -> Result<(), String> {
+        let path_str = match &self.storage_path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let snapshot = CausalSnapshot {
+            edges: self.edges.iter().map(|kv| (*kv.key(), kv.value().clone())).collect(),
+            validations: self.validations.iter().map(|kv| (*kv.key(), *kv.value())).collect(),
+        };
+
+        let file = File::create(path_str).map_err(|e| e.to_string())?;
+        let writer = BufWriter::new(file);
+        bincode::serialize_into(writer, &snapshot).map_err(|e| e.to_string())
+    }
+
+    pub fn load_from_disk(&self) -> Result<usize, String> {
+        let path_str = match &self.storage_path {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+
+        if !Path::new(path_str).exists() {
+            return Ok(0);
+        }
+
+        let file = File::open(path_str).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(file);
+        let snapshot: CausalSnapshot = bincode::deserialize_from(reader).map_err(|e| e.to_string())?;
+
+        let mut count = 0;
+        for (k, v) in snapshot.edges {
+            count += v.len();
+            self.edges.insert(k, v);
+        }
+        for (k, v) in snapshot.validations {
+            self.validations.insert(k, v);
+        }
+        Ok(count)
     }
 }
 
@@ -135,7 +231,6 @@ impl VectorThalamus {
         }
     }
 
-    /// Enruta el vector de entrada calculando 4 productos punto SIMD en <1 µs
     #[inline]
     pub fn route_vector(&self, query_vec: &VectorData) -> (IslandCategory, f32) {
         let guards = self.centroids.read();
@@ -153,7 +248,6 @@ impl VectorThalamus {
         (best_cat, best_sim)
     }
 
-    /// Refuerzo dinámico del centroide por media móvil exponencial (EMA)
     pub fn reinforce_centroid(&self, category: IslandCategory, sample: &VectorData, lr: f32) {
         let mut guards = self.centroids.write();
         for (cat, centroid) in guards.iter_mut() {

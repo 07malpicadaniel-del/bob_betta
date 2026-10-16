@@ -10,4 +10,5 @@ path = "src/main.rs"
 [dependencies]
 vector_db = { path = "../vector_db" }
 cortex = { path = "../cortex" }
+sandbox = { path = "../sandbox" }
 tokio = { version = "1.40", features = ["full"] }
