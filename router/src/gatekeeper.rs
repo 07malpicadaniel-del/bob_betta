@@ -54,7 +54,7 @@ impl Gatekeeper {
 
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
-            let lang_opt = if trimmed.starts_with("```rust") {
+            let lang_opt = if trimmed.starts_with("```rust") || trimmed.starts_with("```rs") {
                 Some(CodeLang::Rust)
             } else if trimmed.starts_with("```bash") || trimmed.starts_with("```sh") {
                 Some(CodeLang::Bash)

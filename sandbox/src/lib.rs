@@ -18,7 +18,6 @@ pub struct FrictionChamber {
 
 impl FrictionChamber {
     pub fn new(max_retries: usize) -> Self {
-        // En Arch Linux, /tmp está montado sobre tmpfs (RAM-disk de ultra baja latencia)
         let work_dir = std::env::temp_dir().join("bob_friction_chamber");
         let _ = fs::create_dir_all(&work_dir);
         Self {
@@ -107,7 +106,7 @@ impl FrictionChamber {
         }
     }
 
-    /// Construye el prompt de retroalimentación cuando el código falla en la Cámara de Fricción
+    /// Construye el prompt de retroalimentación exigiendo código compacto (<35 líneas) con llaves cerradas
     pub fn build_self_correction_prompt(
         original_task: &str,
         failed_code: &str,
@@ -116,27 +115,25 @@ impl FrictionChamber {
         max_attempts: usize,
     ) -> String {
         format!(
-            "System: Eres Bob. Tu código en Rust falló la validación determinista en la Cámara de Fricción (Intento {}/{}).\n\
-            Analiza el error exacto del compilador `rustc`, corrige el código y devuelve ÚNICAMENTE el bloque ```rust corregido con `fn main()` que compile sin errores y sin usar crates externos.\n\n\
-            [Tarea Original]: {}\n\n\
-            [Código Fallido]:\n```rust\n{}\n```\n\n\
-            [STDERR del Compilador rustc]:\n{}\n\n\
-            Bob:",
+            "System: Eres Bob. Corrige el error de compilación en Rust (Intento {}/{}).\n\
+            REGLAS ESTRICTAS: Escribe máximo 35 líneas de código, cero comentarios, cierra todas las llaves `}}` y responde SOLO con el bloque ```rust.\n\n\
+            [Tarea]: {}\n\
+            [Código Fallido]:\n```rust\n{}\n```\n\
+            [Error rustc]:\n{}\n\n\
+            Bob:\n<think>\nCorrigiendo código en menos de 35 líneas cerrando fn main.\n</think>\n```rust\n",
             attempt, max_attempts, original_task, failed_code, compiler_stderr
         )
     }
 
-    /// Fase Hyper-REM: Genera una semilla de colisión sintética entre dos conceptos del Hipocampo
+    /// Fase Hyper-REM: Prefill directo a ```rust y límite de 35 líneas para evitar truncamiento
     pub fn build_rem_dream_prompt(concept_a: &str, concept_b: &str) -> String {
         format!(
-            "System: [MODO HYPER-REM: SUEÑO ALGORÍTMICO ACTIVO]\n\
-            Eres Bob. Estás en tu ciclo de simulación nocturna en la Cámara de Fricción.\n\
-            Debes sintetizar un programa autocontenido en Rust estándar (con `fn main()` y `assert!`, sin crates externos) \
-            que modele y demuestre algorítmicamente la unión eficiente de estos dos axiomas de tu Hipocampo:\n\
-            - Axioma A: {}\n\
-            - Axioma B: {}\n\
-            Escribe un bloque ```rust limpio, rápido y determinista que compile a la primera con `rustc`.\n\
-            Bob:",
+            "System: [MODO HYPER-REM ACTIVO]\n\
+            Eres Bob. Escribe un programa en Rust estándar autocontenido (con `fn main()`, sin crates externos) que combine:\n\
+            1) {}\n\
+            2) {}\n\
+            REGLAS ESTRICTAS: Máximo 35 líneas de código en total, sin comentarios largos, cierra correctamente `fn main()` y usa `println!` para mostrar las métricas.\n\n\
+            Bob:\n<think>\nSintetizando código conciso de 30 líneas.\n</think>\n```rust\n",
             concept_a, concept_b
         )
     }

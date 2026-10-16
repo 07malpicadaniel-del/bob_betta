@@ -24,6 +24,24 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Extrae código Rust tanto si viene con cabecera ```rust como si viene de un prefill directo
+fn extract_rust_from_prefill(text: &str, gatekeeper: &Gatekeeper) -> Option<String> {
+    let blocks = gatekeeper.scan_executable_blocks(text);
+    if let Some(b) = blocks.into_iter().find(|b| b.lang == CodeLang::Rust) {
+        return Some(b.code);
+    }
+    // Si el prompt ya incluía ```rust al final del prefill, leemos hasta el cierre ```
+    let trimmed = text.trim();
+    if trimmed.contains("fn main") {
+        let code_body = match trimmed.find("```") {
+            Some(end_idx) => &trimmed[..end_idx],
+            None => trimmed,
+        };
+        return Some(code_body.trim().to_string());
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() {
     println!("======================================================================");
@@ -110,7 +128,7 @@ async fn main() {
 
     let mut thought_buffer = ThoughtBuffer::new();
     let gatekeeper = Gatekeeper::new(dpo_path);
-    let friction_chamber = FrictionChamber::new(3); // K = 3 intentos de auto-corrección determinista
+    let friction_chamber = FrictionChamber::new(3);
     let mut quiron_shield = QuironShield::new(0.65);
 
     let stdin = io::stdin();
@@ -130,7 +148,6 @@ async fn main() {
             break;
         }
 
-        // Interceptación estricta de comandos REPL con '/' (evita que un typo como /tink llegue al LLM)
         if input_clean.starts_with('/') {
             if input_clean == "/think" || input_clean == "/tink" {
                 match thought_buffer.last_thought() {
@@ -165,7 +182,7 @@ async fn main() {
                 println!("│ [LEGO 5 — ESCUDO QUIRÓN ZERO-KNOWLEDGE]                            │");
                 println!("└────────────────────────────────────────────────────────────────────┘");
                 println!("[*] Tutor Seleccionado: {:?}", packet.tutor);
-                println!("[*] Motivo de Disparo:  {:?}", packet.reason);
+                println!("[*] Motivo de Disparo:  {}", packet.reason.description());
                 println!("[*] Símbolos Ofuscados en RAM (HashMap): {}", packet.symbol_table_size);
                 println!("[*] System Prompt Socrático:\n    {}", packet.socratic_system_prompt);
                 println!("[*] Payload Isomórfico Sanitizado (Lo único que saldría a la red):\n    \"{}\"", packet.sanitized_code_or_query);
@@ -182,39 +199,67 @@ async fn main() {
                 let rem_prompt = FrictionChamber::build_rem_dream_prompt(concept_a, concept_b);
                 if let Ok(raw_rem) = cortex.generate(&rem_prompt) {
                     let parsed_rem = thought_buffer.process_output(&raw_rem);
-                    let blocks = gatekeeper.scan_executable_blocks(&parsed_rem.clean_response);
-                    if let Some(first_rust) = blocks.iter().find(|b| b.lang == CodeLang::Rust) {
-                        let res = friction_chamber.verify_rust_code(&first_rust.code, 1);
-                        if res.compiled_ok {
-                            println!("[✓] Simulación Hyper-REM compilada y verificada con `rustc` (exit_code=0):");
-                            println!("STDOUT:\n{}", res.stdout.trim());
-                            let now_rem = current_timestamp();
-                            let rem_memory = format!(
-                                "[Axioma Cristalizado Hyper-REM]: Síntesis validada entre ({}) y ({}). Código verificado:\n{}",
-                                concept_a, concept_b, first_rust.code
-                            );
-                            if let Ok(rem_vec) = embedder.generate_vector(&rem_memory) {
-                                let (nid, cat) = hippocampus.remember(
-                                    rem_memory,
-                                    rem_vec,
-                                    Some(IslandCategory::Code),
-                                    2,
-                                    now_rem,
+                    if let Some(mut candidate_code) = extract_rust_from_prefill(&parsed_rem.clean_response, &gatekeeper) {
+                        let mut solved = false;
+
+                        for attempt in 1..=friction_chamber.max_retries() {
+                            println!("[*] Validando en Oráculo Determinista `rustc` (Intento {}/{})...", attempt, friction_chamber.max_retries());
+                            let res = friction_chamber.verify_rust_code(&candidate_code, attempt);
+
+                            if res.compiled_ok {
+                                println!("[✓] Simulación Hyper-REM compilada y verificada en intento #{} (exit_code=0):", attempt);
+                                println!("```rust\n{}\n```", candidate_code);
+                                println!("STDOUT:\n{}", res.stdout.trim());
+
+                                let now_rem = current_timestamp();
+                                let rem_memory = format!(
+                                    "[Axioma Cristalizado Hyper-REM]: Síntesis validada entre ({}) y ({}). Código verificado:\n{}",
+                                    concept_a, concept_b, candidate_code
                                 );
-                                causal_graph.record_validation(nid);
-                                causal_graph.record_validation(nid);
-                                println!(
-                                    "[✓] Victoria Hyper-REM cristalizada en Hipocampo -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
-                                    cat,
-                                    nid,
-                                    causal_graph.effective_lambda(nid, false)
-                                );
+                                if let Ok(rem_vec) = embedder.generate_vector(&rem_memory) {
+                                    let (nid, cat) = hippocampus.remember(
+                                        rem_memory,
+                                        rem_vec,
+                                        Some(IslandCategory::Code),
+                                        2,
+                                        now_rem,
+                                    );
+                                    causal_graph.record_validation(nid);
+                                    causal_graph.record_validation(nid);
+                                    println!(
+                                        "[✓] Victoria Hyper-REM cristalizada en Hipocampo -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
+                                        cat,
+                                        nid,
+                                        causal_graph.effective_lambda(nid, false)
+                                    );
+                                }
+                                solved = true;
+                                break;
+                            } else {
+                                println!("[!] Fallo en intento #{}: {}", attempt, res.stderr.lines().next().unwrap_or("Error de sintaxis"));
+                                if attempt < friction_chamber.max_retries() {
+                                    let fix_prompt = FrictionChamber::build_self_correction_prompt(
+                                        "Síntesis Hyper-REM de VectorData 768 + LTP Decay",
+                                        &candidate_code,
+                                        &res.stderr,
+                                        attempt + 1,
+                                        friction_chamber.max_retries(),
+                                    );
+                                    if let Ok(fix_raw) = cortex.generate(&fix_prompt) {
+                                        let fix_parsed = thought_buffer.process_output(&fix_raw);
+                                        if let Some(new_code) = extract_rust_from_prefill(&fix_parsed.clean_response, &gatekeeper) {
+                                            candidate_code = new_code;
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            println!("[!] Sueño descartado por el Oráculo Determinista (fallo de compilación):\n{}", res.stderr.trim());
+                        }
+
+                        if !solved {
+                            println!("[!] Sueño descartado tras agotar los K={} intentos en la Cámara de Fricción.", friction_chamber.max_retries());
                         }
                     } else {
-                        println!("[!] El sueño no produjo un bloque ```rust ejecutable.");
+                        println!("[!] El sueño no produjo código Rust identificable.");
                     }
                 }
             } else {
@@ -225,7 +270,6 @@ async fn main() {
 
         let now = current_timestamp();
 
-        // 1. Vectorización nativa en CPU
         let start_emb = Instant::now();
         let query_vec = match embedder.generate_vector(input_clean) {
             Ok(v) => v,
@@ -236,12 +280,10 @@ async fn main() {
         };
         let emb_elapsed = start_emb.elapsed();
 
-        // 2. Enrutamiento en Tálamo Vectorial (<1 µs)
         let start_thal = Instant::now();
         let (routed_island, thal_sim) = thalamus.route_vector(&query_vec);
         let thal_elapsed = start_thal.elapsed();
 
-        // 3. Recuperación Plano 1 (HNSW) + Plano 2 (Causal)
         let start_rec = Instant::now();
         let memory_context = hippocampus.recall(input_clean, query_vec.clone(), 4, now);
         let seed_ids = CausalHypergraph::extract_seed_ids(&memory_context);
@@ -268,7 +310,6 @@ async fn main() {
             println!("{}", full_context.trim());
         }
 
-        // 4. Ensamblaje de Prompt con RAG Topológico
         let final_prompt = if full_context.is_empty() {
             format!(
                 "System: Eres Bob, un agente autónomo de ingeniería local creado por Daniel.\nUser: {}\nBob:",
@@ -281,7 +322,6 @@ async fn main() {
             )
         };
 
-        // 5. Inferencia en el Córtex (Lego 2)
         println!("[*] Razonando en Córtex (RTX 5060 Ti - 99 capas)...");
         let start_inf = Instant::now();
         match cortex.generate(&final_prompt) {
@@ -298,7 +338,6 @@ async fn main() {
 
                 println!("\n[Bob] ({:.2?}):\n{}", inf_elapsed, parsed.clean_response);
 
-                // 6. Gatekeeper AST + Bucle de Auto-Corrección en Cámara de Fricción (Lego 4, K=3)
                 let code_blocks = gatekeeper.scan_executable_blocks(&parsed.clean_response);
                 let mut validated_by_sandbox = false;
 
@@ -319,7 +358,6 @@ async fn main() {
                                     println!("[✓] LTP Sináptico: Nodo Semilla #{} reforzado (validaciones={}).", seed, n_val);
                                 }
                             } else if block.lang == CodeLang::Rust {
-                                // Activar Bucle de Auto-Corrección Determinista en Cámara de Fricción (K=3)
                                 let mut current_code = block.code.clone();
                                 let mut current_err = outcome.stderr.clone();
                                 let mut fixed = false;
@@ -340,25 +378,23 @@ async fn main() {
 
                                     if let Ok(fix_raw) = cortex.generate(&fix_prompt) {
                                         let fix_parsed = thought_buffer.process_output(&fix_raw);
-                                        let fix_blocks = gatekeeper.scan_executable_blocks(&fix_parsed.clean_response);
-                                        if let Some(rust_fix) = fix_blocks.iter().find(|b| b.lang == CodeLang::Rust) {
-                                            let verify = friction_chamber.verify_rust_code(&rust_fix.code, attempt);
+                                        if let Some(rust_fix_code) = extract_rust_from_prefill(&fix_parsed.clean_response, &gatekeeper) {
+                                            let verify = friction_chamber.verify_rust_code(&rust_fix_code, attempt);
                                             if verify.compiled_ok {
                                                 println!("[✓] Auto-corrección exitosa en intento #{}:", attempt);
-                                                println!("```rust\n{}\n```", rust_fix.code);
+                                                println!("```rust\n{}\n```", rust_fix_code);
                                                 println!("STDOUT:\n{}", verify.stdout.trim());
                                                 validated_by_sandbox = true;
                                                 fixed = true;
                                                 break;
                                             } else {
-                                                current_code = rust_fix.code.clone();
+                                                current_code = rust_fix_code;
                                                 current_err = verify.stderr;
                                             }
                                         }
                                     }
                                 }
 
-                                // Si fallan los K=3 intentos, el Disparador Epistémico activa el Protocolo Quirón (Lego 5)
                                 if !fixed {
                                     if let Some(reason) = quiron_shield.evaluate_trigger(
                                         thal_sim,
@@ -367,7 +403,7 @@ async fn main() {
                                     ) {
                                         let packet = quiron_shield.sanitize_context(&current_code, routed_island, reason);
                                         println!("\n[!] Estancamiento en Cámara de Fricción detectado -> Escudo Quirón (Lego 5) preparado:");
-                                        println!("    Tutor: {:?} | Símbolos protegidos en RAM: {}", packet.tutor, packet.symbol_table_size);
+                                        println!("    Motivo: {} | Tutor: {:?} | Símbolos protegidos en RAM: {}", packet.reason.description(), packet.tutor, packet.symbol_table_size);
                                     }
                                 }
                             }
@@ -375,7 +411,6 @@ async fn main() {
                     }
                 }
 
-                // 7. Consolidación en Hipocampo + Enlace Causal Automático
                 let memory_text = format!("Usuario: {} | Bob: {}", input_clean, parsed.clean_response);
                 match embedder.generate_vector(&memory_text) {
                     Ok(memory_vec) => {

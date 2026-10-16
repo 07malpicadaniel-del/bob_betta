@@ -8,6 +8,22 @@ pub enum TriggerReason {
     InvocacionExplicita,
 }
 
+impl TriggerReason {
+    pub fn description(&self) -> String {
+        match self {
+            TriggerReason::VacioTopologico(sim) => {
+                format!("Vacío Topológico en Hipocampo (similitud máxima = {:.2} < umbral)", sim)
+            }
+            TriggerReason::FriccionEstancada(intentos) => {
+                format!("Fricción Estancada en Sandbox ({} fallos de compilación consecutivos)", intentos)
+            }
+            TriggerReason::InvocacionExplicita => {
+                "Invocación Explícita del Arquitecto (/quiron)".to_string()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExternalTutor {
     ClaudeOpusSystems,
@@ -72,23 +88,20 @@ impl QuironShield {
         self.real_to_token.clear();
         self.token_to_real.clear();
 
-        // Etapa A.1: Purgar comentarios de línea y rutas locales de Arch Linux
         let mut cleaned_lines = Vec::new();
         for line in raw_input.lines() {
             let without_comment = match line.find("//") {
                 Some(idx) if !line[..idx].contains("http") => &line[..idx],
                 _ => line,
             };
-            let masked_paths = without_comment
-                .replace("/home/daniel/proyectos/bob_engine", "/workspace/root")
-                .replace("/home/daniel", "/user/home")
-                .replace("127.0.0.1", "0.0.0.0");
-            cleaned_lines.push(masked_paths);
+            cleaned_lines.push(without_comment.to_string());
         }
         let mut obfuscated = cleaned_lines.join("\n");
 
-        // Etapa A.2: Sustitución biyectiva de entidades propietarias y de dominio
+        // Sustitución biyectiva de rutas locales y entidades propietarias
         let sensitive_entities = [
+            "/home/daniel/proyectos/bob_engine",
+            "/home/daniel",
             "HippocampusEngine",
             "CausalHypergraph",
             "VectorThalamus",
@@ -118,7 +131,11 @@ impl QuironShield {
         let mut counter = 1usize;
         for entity in sensitive_entities {
             if obfuscated.contains(entity) {
-                let token = format!("Symbol_Node_{:02}", counter);
+                let token = if entity.starts_with('/') {
+                    format!("/workspace/path_{:02}", counter)
+                } else {
+                    format!("Symbol_Node_{:02}", counter)
+                };
                 counter += 1;
                 obfuscated = obfuscated.replace(entity, &token);
                 self.real_to_token.insert(entity.to_string(), token.clone());
@@ -143,7 +160,7 @@ impl QuironShield {
         }
     }
 
-    /// 3. Re-hidratación en RAM: Invierte el mapeo algebraico restaurando los nombres propietarios (Fase 6.4)
+    /// 3. Re-hidratación en RAM: Invierte el mapeo algebraico restaurando nombres y rutas reales
     pub fn rehydrate(&mut self, abstract_response: &str) -> String {
         let mut restored = abstract_response.to_string();
         for (token, real_name) in &self.token_to_real {
