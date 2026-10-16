@@ -56,7 +56,7 @@ impl AgentToolkit {
         }
 
         // 2. Reflejo de Listado de Directorios si menciona una ruta del proyecto
-        if (lower.contains("qué módulos") || lower.contains("que modulos") || lower.contains("qué archivos") || lower.contains("lista"))
+        if (lower.contains("qué módulos") || lower.contains("que modulos") || lower.contains("qué archivos") || lower.contains("que archivos") || lower.contains("archivos hay") || lower.contains("lista"))
             && !calls.iter().any(|c| matches!(c, AgentToolCall::ListDir { .. }))
         {
             if lower.contains("router/src") || lower.contains("crate router") {

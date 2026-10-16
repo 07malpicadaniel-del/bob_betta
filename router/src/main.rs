@@ -480,7 +480,7 @@ async fn main() {
             for call in &reflex_calls {
                 println!("[*] [REFLEJO AGÉNTICO] Ejecutando `{:?}`...", call);
                 let res = AgentToolkit::execute_tool(call);
-                println!("[✓] [{}] Datos obtenidos:\n{}", res.tool_name, res.output.trim());
+                println!("[✓] [{} (Aprobado={})] Datos obtenidos:\n{}", res.tool_name, res.approved, res.output.trim());
                 full_context.push_str(&format!("[{}]:\n{}\n", res.tool_name, res.output));
             }
         }
@@ -520,8 +520,9 @@ async fn main() {
                 }
 
                 // Si Bob decidió invocar una herramienta adicional durante su respuesta, la ejecutamos en bucle ReAct
-                if !pre_executed_tools {
-                    let llm_tool_calls = AgentToolkit::parse_tool_calls(&raw_response);
+                if parsed.clean_response.contains("[TOOL:") {
+                    let _ = pre_executed_tools;
+                    let llm_tool_calls = AgentToolkit::parse_tool_calls(&parsed.clean_response);
                     if !llm_tool_calls.is_empty() {
                         let mut observations = String::new();
                         for call in &llm_tool_calls {
