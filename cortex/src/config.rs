@@ -12,6 +12,7 @@ pub struct CortexConfig {
     pub batch_size: u32,
     pub server_bin: PathBuf,
     pub model_path: PathBuf,
+    pub slot_save_dir: PathBuf,
 }
 
 impl Default for CortexConfig {
@@ -20,6 +21,9 @@ impl Default for CortexConfig {
             .parent()
             .expect("No se pudo obtener la raíz del workspace")
             .to_path_buf();
+
+        let slot_save_dir = std::env::temp_dir().join("bob_kv_slots");
+        let _ = std::fs::create_dir_all(&slot_save_dir);
 
         Self {
             host: "127.0.0.1".to_string(),
@@ -32,6 +36,7 @@ impl Default for CortexConfig {
             batch_size: 512,
             server_bin: workspace_root.join("llama.cpp/build/bin/llama-server"),
             model_path: workspace_root.join("models/Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf"),
+            slot_save_dir,
         }
     }
 }

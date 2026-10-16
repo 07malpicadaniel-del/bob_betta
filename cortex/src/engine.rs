@@ -26,7 +26,6 @@ pub struct CortexEngine {
 }
 
 impl CortexEngine {
-    /// Conecta a un llama-server existente o levanta el proceso automáticamente en segundo plano
     pub fn new(config: CortexConfig) -> Result<Self, String> {
         let mut engine = Self {
             config,
@@ -63,6 +62,8 @@ impl CortexEngine {
             ));
         }
 
+        let _ = std::fs::create_dir_all(&self.config.slot_save_dir);
+
         let child = Command::new(&self.config.server_bin)
             .arg("-m")
             .arg(&self.config.model_path)
@@ -80,6 +81,8 @@ impl CortexEngine {
             .arg(self.config.ctx_size.to_string())
             .arg("-b")
             .arg(self.config.batch_size.to_string())
+            .arg("--slot-save-path")
+            .arg(&self.config.slot_save_dir)
             .arg("--port")
             .arg(self.config.port.to_string())
             .arg("--host")
@@ -99,7 +102,7 @@ impl CortexEngine {
             if let Some(child) = &mut self.server_process {
                 if let Ok(Some(status)) = child.try_wait() {
                     return Err(format!(
-                        "El subproceso llama-server abortó prematuramente con estado: {} (verifica VRAM libre)",
+                        "El subproceso llama-server abortó prematuramente con estado: {}",
                         status
                     ));
                 }
@@ -115,13 +118,17 @@ impl CortexEngine {
         Err("Tiempo de espera agotado esperando a que el Córtex cargue el modelo en VRAM".to_string())
     }
 
-    /// Envía el prompt al motor nativo reutilizando el KV Cache (cache_prompt = true)
     pub fn generate(&self, prompt: &str) -> Result<String, String> {
+        self.generate_branch(prompt, self.config.temperature)
+    }
+
+    /// Genera una rama lógica con temperatura personalizada reutilizando el KV Cache (Prefix Sharing)
+    pub fn generate_branch(&self, prompt: &str, temperature: f32) -> Result<String, String> {
         let url = format!("{}/completion", self.config.base_url());
         let body = CompletionRequest {
             prompt,
             n_predict: self.config.n_predict,
-            temperature: self.config.temperature,
+            temperature,
             id_slot: self.config.slot_id,
             cache_prompt: true,
             stream: false,

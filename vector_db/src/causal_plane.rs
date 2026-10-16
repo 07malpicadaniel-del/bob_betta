@@ -261,3 +261,39 @@ impl VectorThalamus {
         }
     }
 }
+
+impl CausalHypergraph {
+    /// Genera un vector unitario aleatorio en la hiperesfera de 768 dimensiones para muestreo dinámico HNSW
+    pub fn random_hypersphere_probe() -> VectorData {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut vec = VectorData::default();
+        for i in 0..VECTOR_DIM {
+            vec.raw[i] = rng.gen_range(-1.0f32..1.0f32);
+        }
+        VectorNormalizer::normalize_l2(&mut vec);
+        vec
+    }
+
+    /// Extrae pares (NodeId, Resumen) desde la salida de HippocampusEngine::recall
+    pub fn extract_nodes_with_text(recall_context: &str) -> Vec<(NodeId, String)> {
+        let mut results = Vec::new();
+        let marker = "Nodo ID: ";
+
+        for line in recall_context.lines() {
+            if let Some(pos) = line.find(marker) {
+                let after = &line[pos + marker.len()..];
+                let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(id) = digits.parse::<NodeId>() {
+                    if let Some(close_paren) = after.find(')') {
+                        let text = after[close_paren + 1..].trim().to_string();
+                        if text.len() > 45 && !text.contains("/tink") && !results.iter().any(|(existing_id, _)| *existing_id == id) {
+                            results.push((id, text));
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+}

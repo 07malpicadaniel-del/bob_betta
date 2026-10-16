@@ -1,17 +1,21 @@
+mod abe;
 mod gatekeeper;
 mod quiron;
 mod thought_buffer;
+mod tools;
 
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use abe::BinaryScenarioTree;
 use cortex::kv_cache::KvCacheManager;
 use cortex::{CortexConfig, CortexEngine};
 use gatekeeper::{CodeLang, Gatekeeper};
 use quiron::{QuironShield, TriggerReason};
 use sandbox::FrictionChamber;
 use thought_buffer::ThoughtBuffer;
+use tools::AgentToolkit;
 use vector_db::causal_plane::{CausalHypergraph, CausalRelation, VectorThalamus};
 use vector_db::common::types::IslandCategory;
 use vector_db::ingestion::embedder::NativeEmbedder;
@@ -24,30 +28,59 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Extrae código Rust tanto si viene con cabecera ```rust como si viene de un prefill directo
-fn extract_rust_from_prefill(text: &str, gatekeeper: &Gatekeeper) -> Option<String> {
+fn balance_rust_delimiters(mut code: String) -> String {
+    let mut open_braces: i32 = 0;
+    let mut in_string = false;
+    let mut prev_char = '\0';
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        for ch in line.chars() {
+            if ch == '"' && prev_char != '\\' {
+                in_string = !in_string;
+            } else if !in_string {
+                if ch == '{' {
+                    open_braces += 1;
+                } else if ch == '}' {
+                    open_braces -= 1;
+                }
+            }
+            prev_char = ch;
+        }
+    }
+
+    while open_braces > 0 {
+        code.push_str("\n}");
+        open_braces -= 1;
+    }
+    code
+}
+
+pub fn extract_rust_from_prefill(text: &str, gatekeeper: &Gatekeeper) -> Option<String> {
     let blocks = gatekeeper.scan_executable_blocks(text);
     if let Some(b) = blocks.into_iter().find(|b| b.lang == CodeLang::Rust) {
-        return Some(b.code);
+        return Some(balance_rust_delimiters(b.code));
     }
-    // Si el prompt ya incluía ```rust al final del prefill, leemos hasta el cierre ```
     let trimmed = text.trim();
     if trimmed.contains("fn main") {
         let code_body = match trimmed.find("```") {
             Some(end_idx) => &trimmed[..end_idx],
             None => trimmed,
         };
-        return Some(code_body.trim().to_string());
+        return Some(balance_rust_delimiters(code_body.trim().to_string()));
     }
     None
 }
 
 #[tokio::main]
 async fn main() {
-    println!("======================================================================");
-    println!("  BOB Engine v2.0 — Arquitectura Completa (Legos 1 a 5 Activos)       ");
-    println!("  Comandos: /think | /rem | /quiron <txt> | /status | /kv-clear | exit");
-    println!("======================================================================");
+    println!("=========================================================================================");
+    println!("  BOB Engine v2.0 — Agente Autónomo Local (Legos 1-5 + ABE + PC Tools + Web Search)     ");
+    println!("  Comandos: /web <q> | /tools | /deep-think <reto> | /rem | /quiron <txt> | /think | exit");
+    println!("=========================================================================================");
 
     let wal_path = "bob_memories.wal";
     let causal_path = "bob_causal.bin";
@@ -124,7 +157,7 @@ async fn main() {
     let cortex_cfg = CortexConfig::default();
     let kv_manager = KvCacheManager::new(&cortex_cfg.base_url());
     let cortex = CortexEngine::new(cortex_cfg).expect("[!] Error crítico al levantar el Córtex");
-    println!("[✓] Córtex 27B cargado en VRAM (99 capas, KV q8_0).");
+    println!("[✓] Córtex 27B cargado en VRAM (99 capas, KV q8_0, Slot-Save en RAM-disk).");
 
     let mut thought_buffer = ThoughtBuffer::new();
     let gatekeeper = Gatekeeper::new(dpo_path);
@@ -154,6 +187,20 @@ async fn main() {
                     Some(t) => println!("\n--- [ÚLTIMO ÁRBOL DE PENSAMIENTO <think>] ---\n{}\n---------------------------------------------", t),
                     None => println!("[*] Aún no hay trazas de pensamiento en esta sesión."),
                 }
+            } else if input_clean == "/tools" {
+                println!("\n┌────────────────────────────────────────────────────────────────────┐");
+                println!("│ [HERRAMIENTAS NATIVAS DE AGENTE EN ARCH LINUX + INTERNET]          │");
+                println!("└────────────────────────────────────────────────────────────────────┘");
+                println!("{}", AgentToolkit::system_prompt_instructions());
+            } else if let Some(web_q) = input_clean.strip_prefix("/web") {
+                let q = web_q.trim();
+                if q.is_empty() {
+                    println!("[!] Uso: /web <consulta a buscar en internet>");
+                } else {
+                    println!("[*] Buscando en Internet: `{}`...", q);
+                    let results = AgentToolkit::search_internet(q);
+                    println!("\n{}\n", results);
+                }
             } else if input_clean == "/status" {
                 println!(
                     "[*] Estado -> Aristas Causales: {} | Max Retries Fricción: K={} | WAL: `{}` | DPO: `{}`",
@@ -166,6 +213,78 @@ async fn main() {
                 match kv_manager.erase_slot(0) {
                     Ok(res) => println!("[✓] KV Cache purgado en RTX 5060 Ti (Slot {}): {:?} tokens liberados.", res.id_slot, res.n_erased),
                     Err(e) => eprintln!("[!] {}", e),
+                }
+            } else if let Some(problem_raw) = input_clean.strip_prefix("/deep-think") {
+                let problem = if problem_raw.trim().is_empty() {
+                    "Implementar un filtro de decaimiento exponencial y producto punto para 4 nodos de telemetría en Rust"
+                } else {
+                    problem_raw.trim()
+                };
+
+                let now_dt = current_timestamp();
+                let dt_vec = embedder.generate_vector(problem).unwrap_or_default();
+                let hippo_ctx = hippocampus.recall(problem, dt_vec, 3, now_dt);
+                let seeds = CausalHypergraph::extract_seed_ids(&hippo_ctx);
+
+                match BinaryScenarioTree::execute_deep_think(
+                    problem,
+                    &hippo_ctx,
+                    &cortex,
+                    &kv_manager,
+                    &friction_chamber,
+                    &gatekeeper,
+                    &mut thought_buffer,
+                    extract_rust_from_prefill,
+                ) {
+                    Ok(abe_res) => {
+                        println!(
+                            "\n[✓] [ESCENARIO IDEAL GANADOR]: {} ({}) | KV Trunk Compartido: {} tokens | Intentos: {}",
+                            abe_res.winning_branch.name,
+                            abe_res.winning_branch.strategy,
+                            abe_res.kv_shared_bytes,
+                            abe_res.winning_branch.attempts_used
+                        );
+                        println!("```rust\n{}\n```", abe_res.winning_branch.code);
+                        println!("STDOUT:\n{}", abe_res.winning_branch.stdout.trim());
+
+                        let abe_memory = format!(
+                            "[Trayectoria Ideal ABE /deep-think]: Problema: {} | Estrategia Ganadora: {} (Podada: {}). Código:\n{}",
+                            problem,
+                            abe_res.winning_branch.strategy,
+                            abe_res.pruned_branch_name,
+                            abe_res.winning_branch.code
+                        );
+                        if let Ok(abe_vec) = embedder.generate_vector(&abe_memory) {
+                            let (nid, cat) = hippocampus.remember(
+                                abe_memory,
+                                abe_vec,
+                                Some(IslandCategory::Code),
+                                2,
+                                now_dt,
+                            );
+                            causal_graph.record_validation(nid);
+                            causal_graph.record_validation(nid);
+
+                            if let Some(&primary_seed) = seeds.first() {
+                                causal_graph.link_nodes(
+                                    nid,
+                                    primary_seed,
+                                    CausalRelation::Optimiza,
+                                    format!("Trayectoria ABE optimizada para: {}", problem),
+                                    0.98,
+                                    now_dt,
+                                );
+                            }
+
+                            println!(
+                                "[✓] Trayectoria Ideal ABE cristalizada en Hipocampo -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
+                                cat,
+                                nid,
+                                causal_graph.effective_lambda(nid, false)
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[!] Error en Árbol Binario de Escenarios: {}", e),
                 }
             } else if let Some(query_to_sanitize) = input_clean.strip_prefix("/quiron") {
                 let sample = if query_to_sanitize.trim().is_empty() {
@@ -190,13 +309,42 @@ async fn main() {
                 println!("[✓] Prueba de Re-hidratación en RAM exitosa:\n    \"{}\"", restored_demo);
             } else if input_clean == "/rem" {
                 println!("\n┌────────────────────────────────────────────────────────────────────┐");
-                println!("│ [LEGO 4 — CICLO HYPER-REM (SUEÑO ALGORÍTMICO POR FRICCIÓN)]        │");
+                println!("│ [LEGO 4 — CICLO HYPER-REM (MUESTREO DINÁMICO DEL HIPOCAMPO)]       │");
                 println!("└────────────────────────────────────────────────────────────────────┘");
-                let concept_a = "VectorData de 768 flotantes alineado a 64 bytes con normalización L2";
-                let concept_b = "Ecuación de Potenciación a Largo Plazo (LTP) con decaimiento logarítmico según validaciones";
-                println!("[*] Colisionando conceptos en Cámara de Fricción:\n    A: {}\n    B: {}", concept_a, concept_b);
 
-                let rem_prompt = FrictionChamber::build_rem_dream_prompt(concept_a, concept_b);
+                let now_rem = current_timestamp();
+                let probe_a = CausalHypergraph::random_hypersphere_probe();
+                let probe_b = CausalHypergraph::random_hypersphere_probe();
+
+                let raw_recall_a = hippocampus.recall("architecture axiom core rule", probe_a, 3, now_rem);
+                let raw_recall_b = hippocampus.recall("rust code algorithm struct", probe_b, 3, now_rem);
+
+                let mut candidates = CausalHypergraph::extract_nodes_with_text(&raw_recall_a);
+                for (id, txt) in CausalHypergraph::extract_nodes_with_text(&raw_recall_b) {
+                    if !candidates.iter().any(|(cid, _)| *cid == id) {
+                        candidates.push((id, txt));
+                    }
+                }
+
+                let (parent_a_id, concept_a) = candidates
+                    .first()
+                    .cloned()
+                    .unwrap_or((0, "VectorData de 768 flotantes alineado a 64 bytes con normalización L2".to_string()));
+
+                let (parent_b_id, concept_b) = candidates
+                    .get(1)
+                    .cloned()
+                    .unwrap_or((1, "Ecuación de Potenciación a Largo Plazo (LTP) con decaimiento logarítmico".to_string()));
+
+                let short_a: String = concept_a.chars().take(110).collect();
+                let short_b: String = concept_b.chars().take(110).collect();
+
+                println!(
+                    "[*] Nodos extraídos dinámicamente del Hipocampo:\n    ├─ Nodo Padre #{}: {}...\n    └─ Nodo Padre #{}: {}...",
+                    parent_a_id, short_a, parent_b_id, short_b
+                );
+
+                let rem_prompt = FrictionChamber::build_rem_dream_prompt(&short_a, &short_b);
                 if let Ok(raw_rem) = cortex.generate(&rem_prompt) {
                     let parsed_rem = thought_buffer.process_output(&raw_rem);
                     if let Some(mut candidate_code) = extract_rust_from_prefill(&parsed_rem.clean_response, &gatekeeper) {
@@ -211,10 +359,9 @@ async fn main() {
                                 println!("```rust\n{}\n```", candidate_code);
                                 println!("STDOUT:\n{}", res.stdout.trim());
 
-                                let now_rem = current_timestamp();
                                 let rem_memory = format!(
-                                    "[Axioma Cristalizado Hyper-REM]: Síntesis validada entre ({}) y ({}). Código verificado:\n{}",
-                                    concept_a, concept_b, candidate_code
+                                    "[Axioma Cristalizado Hyper-REM]: Síntesis entre Nodo #{} ({}) y Nodo #{} ({}). Código:\n{}",
+                                    parent_a_id, short_a, parent_b_id, short_b, candidate_code
                                 );
                                 if let Ok(rem_vec) = embedder.generate_vector(&rem_memory) {
                                     let (nid, cat) = hippocampus.remember(
@@ -226,8 +373,26 @@ async fn main() {
                                     );
                                     causal_graph.record_validation(nid);
                                     causal_graph.record_validation(nid);
+
+                                    causal_graph.link_nodes(
+                                        nid,
+                                        parent_a_id,
+                                        CausalRelation::DependeDe,
+                                        format!("Síntesis REM derivada de Nodo #{}", parent_a_id),
+                                        0.95,
+                                        now_rem,
+                                    );
+                                    causal_graph.link_nodes(
+                                        nid,
+                                        parent_b_id,
+                                        CausalRelation::Optimiza,
+                                        format!("Síntesis REM que optimiza Nodo #{}", parent_b_id),
+                                        0.95,
+                                        now_rem,
+                                    );
+
                                     println!(
-                                        "[✓] Victoria Hyper-REM cristalizada en Hipocampo -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
+                                        "[✓] Victoria Hyper-REM cristalizada -> Isla: {:?}, Nodo ID: {} (λ={:.6}) | +2 Aristas Causales enlazadas.",
                                         cat,
                                         nid,
                                         causal_graph.effective_lambda(nid, false)
@@ -239,7 +404,7 @@ async fn main() {
                                 println!("[!] Fallo en intento #{}: {}", attempt, res.stderr.lines().next().unwrap_or("Error de sintaxis"));
                                 if attempt < friction_chamber.max_retries() {
                                     let fix_prompt = FrictionChamber::build_self_correction_prompt(
-                                        "Síntesis Hyper-REM de VectorData 768 + LTP Decay",
+                                        "Síntesis Hyper-REM dinámica",
                                         &candidate_code,
                                         &res.stderr,
                                         attempt + 1,
@@ -263,7 +428,7 @@ async fn main() {
                     }
                 }
             } else {
-                println!("[!] Comando REPL desconocido: `{}`. Usa: /think | /rem | /quiron <txt> | /status | /kv-clear | exit", input_clean);
+                println!("[!] Comando REPL desconocido: `{}`. Usa: /web <q> | /tools | /deep-think <reto> | /rem | /quiron <txt> | /think | /status | /kv-clear | exit", input_clean);
             }
             continue;
         }
@@ -306,34 +471,76 @@ async fn main() {
             }
         }
 
-        if !full_context.is_empty() {
-            println!("{}", full_context.trim());
+        // Reflejo Autónomo Pre-Inferencia (Herramientas de PC + Búsqueda en Internet)
+        let reflex_calls = AgentToolkit::detect_reflex_tools(input_clean, thal_sim);
+        let mut pre_executed_tools = false;
+        if !reflex_calls.is_empty() {
+            pre_executed_tools = true;
+            full_context.push_str("\n### OBSERVACIONES REALES DE HERRAMIENTAS Y WEB EN VIVO:\n");
+            for call in &reflex_calls {
+                println!("[*] [REFLEJO AGÉNTICO] Ejecutando `{:?}`...", call);
+                let res = AgentToolkit::execute_tool(call);
+                println!("[✓] [{}] Datos obtenidos:\n{}", res.tool_name, res.output.trim());
+                full_context.push_str(&format!("[{}]:\n{}\n", res.tool_name, res.output));
+            }
         }
 
-        let final_prompt = if full_context.is_empty() {
-            format!(
-                "System: Eres Bob, un agente autónomo de ingeniería local creado por Daniel.\nUser: {}\nBob:",
-                input_clean
-            )
+        // Plantilla ChatML nativa de Qwen 3.8 para garantizar respuestas completas sin corte prematuro
+        let system_block = format!(
+            "Eres Bob, un agente autónomo de ingeniería local creado por Daniel en Arch Linux.\n\
+            Responde siempre en español de forma técnica, directa y precisa.\n\
+            Si en el contexto aparecen 'OBSERVACIONES REALES DE HERRAMIENTAS Y WEB EN VIVO', utiliza esos datos exactos para responder.\n\
+            {}",
+            AgentToolkit::system_prompt_instructions()
+        );
+
+        let user_block = if full_context.is_empty() {
+            input_clean.to_string()
         } else {
-            format!(
-                "System: Eres Bob, un agente autónomo de ingeniería local creado por Daniel. Utiliza tu memoria del Hipocampo 4D para responder con precisión.\n{}\nUser: {}\nBob:",
-                full_context, input_clean
-            )
+            format!("Contexto y Datos en Vivo:\n{}\n\nPregunta de Daniel: {}", full_context, input_clean)
         };
+
+        let final_prompt = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            system_block, user_block
+        );
 
         println!("[*] Razonando en Córtex (RTX 5060 Ti - 99 capas)...");
         let start_inf = Instant::now();
         match cortex.generate(&final_prompt) {
             Ok(raw_response) => {
                 let inf_elapsed = start_inf.elapsed();
-                let parsed = thought_buffer.process_output(&raw_response);
+                let mut parsed = thought_buffer.process_output(&raw_response);
 
                 if parsed.thinking_trace.is_some() {
                     println!(
                         "[*] Buffer de Pensamiento Oculto: {} líneas / {} palabras evaluadas (escribe `/think` para inspeccionar).",
                         parsed.thought_lines, parsed.thought_words
                     );
+                }
+
+                // Si Bob decidió invocar una herramienta adicional durante su respuesta, la ejecutamos en bucle ReAct
+                if !pre_executed_tools {
+                    let llm_tool_calls = AgentToolkit::parse_tool_calls(&raw_response);
+                    if !llm_tool_calls.is_empty() {
+                        let mut observations = String::new();
+                        for call in &llm_tool_calls {
+                            println!("[*] [AGENTE REACT] Ejecutando herramienta solicitada por Córtex: `{:?}`...", call);
+                            let res = AgentToolkit::execute_tool(call);
+                            println!("[✓] [{}] Datos capturados:\n{}", res.tool_name, res.output.trim());
+                            observations.push_str(&format!("[{}]:\n{}\n", res.tool_name, res.output));
+                        }
+
+                        let followup_prompt = format!(
+                            "<|im_start|>system\nEres Bob. Entrega la respuesta final en español usando los datos reales obtenidos.<|im_end|>\n\
+                            <|im_start|>user\nPregunta: {}\n\nDatos Reales Capturados:\n{}<|im_end|>\n\
+                            <|im_start|>assistant\n",
+                            input_clean, observations
+                        );
+                        if let Ok(second_raw) = cortex.generate(&followup_prompt) {
+                            parsed = thought_buffer.process_output(&second_raw);
+                        }
+                    }
                 }
 
                 println!("\n[Bob] ({:.2?}):\n{}", inf_elapsed, parsed.clean_response);
@@ -411,42 +618,45 @@ async fn main() {
                     }
                 }
 
-                let memory_text = format!("Usuario: {} | Bob: {}", input_clean, parsed.clean_response);
-                match embedder.generate_vector(&memory_text) {
-                    Ok(memory_vec) => {
-                        thalamus.reinforce_centroid(routed_island, &memory_vec, 0.05);
-                        let (node_id, cat) = hippocampus.remember(
-                            memory_text.clone(),
-                            memory_vec,
-                            Some(routed_island),
-                            1,
-                            now,
-                        );
-
-                        if validated_by_sandbox {
-                            causal_graph.record_validation(node_id);
-                        }
-
-                        if let Some(&primary_seed) = seed_ids.first() {
-                            let summary_short: String = memory_text.chars().take(120).collect();
-                            causal_graph.link_nodes(
-                                node_id,
-                                primary_seed,
-                                CausalRelation::DependeDe,
-                                format!("{}...", summary_short),
-                                0.90,
+                // Solo consolidamos en el Hipocampo si la respuesta no está vacía
+                if !parsed.clean_response.trim().is_empty() {
+                    let memory_text = format!("Usuario: {} | Bob: {}", input_clean, parsed.clean_response);
+                    match embedder.generate_vector(&memory_text) {
+                        Ok(memory_vec) => {
+                            thalamus.reinforce_centroid(routed_island, &memory_vec, 0.05);
+                            let (node_id, cat) = hippocampus.remember(
+                                memory_text.clone(),
+                                memory_vec,
+                                Some(routed_island),
+                                1,
                                 now,
                             );
-                        }
 
-                        println!(
-                            "[*] Memoria consolidada -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
-                            cat,
-                            node_id,
-                            causal_graph.effective_lambda(node_id, cat == IslandCategory::CoreRules)
-                        );
+                            if validated_by_sandbox {
+                                causal_graph.record_validation(node_id);
+                            }
+
+                            if let Some(&primary_seed) = seed_ids.first() {
+                                let summary_short: String = memory_text.chars().take(120).collect();
+                                causal_graph.link_nodes(
+                                    node_id,
+                                    primary_seed,
+                                    CausalRelation::DependeDe,
+                                    format!("{}...", summary_short),
+                                    0.90,
+                                    now,
+                                );
+                            }
+
+                            println!(
+                                "[*] Memoria consolidada -> Isla: {:?}, Nodo ID: {} (λ={:.6})",
+                                cat,
+                                node_id,
+                                causal_graph.effective_lambda(node_id, cat == IslandCategory::CoreRules)
+                            );
+                        }
+                        Err(e) => eprintln!("[!] Error consolidando vector en Hipocampo: {}", e),
                     }
-                    Err(e) => eprintln!("[!] Error consolidando vector en Hipocampo: {}", e),
                 }
             }
             Err(e) => eprintln!("[!] Error en Córtex: {}", e),
