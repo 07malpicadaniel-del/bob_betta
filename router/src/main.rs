@@ -1,3 +1,5 @@
+mod ecosystem_seed;
+mod server;
 mod abe;
 mod gatekeeper;
 mod quiron;
@@ -163,6 +165,47 @@ async fn main() {
     let gatekeeper = Gatekeeper::new(dpo_path);
     let friction_chamber = FrictionChamber::new(3);
     let mut quiron_shield = QuironShield::new(0.65);
+
+    // Sembrar contexto del ecosistema de Daniel y proyectos locales si el grafo tiene pocas aristas
+    if causal_graph.total_edges() < 6 {
+        println!("[*] Sembrando contexto maestro del ecosistema de Daniel + proyectos en Hipocampo 4D...");
+        let seeded = ecosystem_seed::EcosystemSeeder::seed_daniel_ecosystem(&hippocampus, &causal_graph, &embedder, now_boot);
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
+        let projs = ecosystem_seed::EcosystemSeeder::scan_and_ingest_local_projects(
+            std::path::Path::new(&home_dir).join("proyectos").as_path(),
+            &hippocampus,
+            &causal_graph,
+            &embedder,
+            now_boot,
+        );
+        println!("[✓] Ecosistema sincronizado: {} axiomas maestros + {} repositorios locales indexados.", seeded, projs.len());
+    }
+
+    // Iniciar Servidor Puente para AXIS UI en 127.0.0.1:8086
+    let shared_state = Arc::new(server::BobSharedState {
+        hippocampus: Arc::clone(&hippocampus),
+        embedder: Arc::clone(&embedder),
+        thalamus: Arc::clone(&thalamus),
+        causal_graph: Arc::clone(&causal_graph),
+        cortex: Arc::new(cortex),
+        kv_manager: Arc::new(kv_manager),
+        friction_chamber: Arc::new(FrictionChamber::new(3)),
+        gatekeeper: Arc::new(Gatekeeper::new(dpo_path)),
+        thought_buffer: tokio::sync::Mutex::new(ThoughtBuffer::new()),
+        quiron_shield: tokio::sync::Mutex::new(QuironShield::new(0.65)),
+    });
+    let cortex = Arc::clone(&shared_state.cortex);
+    let kv_manager = Arc::clone(&shared_state.kv_manager);
+
+    tokio::spawn(server::start_axis_bridge_server(Arc::clone(&shared_state), 8086));
+
+    // Si se lanzó con --daemon desde AXIS UI, mantenemos el demonio vivo sin bloquear por stdin
+    if std::env::args().any(|a| a == "--daemon") {
+        println!("[*] BOB ejecutándose en modo Daemon para AXIS UI (puerto 8086)...");
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
