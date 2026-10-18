@@ -235,8 +235,19 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
         }
     };
 
-    let raw_msg = parsed_req.message.trim();
-    // Soportar prefijo [ISLAND:slug] enviado desde el selector de islas de AXIS UI
+    let raw_input = parsed_req.message.trim();
+    // 1. Extraer [SESSION:chat_id] para aislar el historial de cada chat individual
+    let (session_id, raw_msg) = if let Some(rest) = raw_input.strip_prefix("[SESSION:") {
+        if let Some(end_s) = rest.find(']') {
+            (rest[..end_s].trim().to_string(), rest[end_s + 1..].trim())
+        } else {
+            ("default".to_string(), raw_input)
+        }
+    } else {
+        ("default".to_string(), raw_input)
+    };
+
+    // 2. Extraer [ISLAND:slug] enviado desde el selector de islas de AXIS UI
     let (mut selected_island_slug, msg) = if let Some(rest) = raw_msg.strip_prefix("[ISLAND:") {
         if let Some(end_b) = rest.find(']') {
             let slug = rest[..end_b].trim().to_string();
@@ -409,9 +420,11 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
         }
     }
 
-    let current_scope_key = selected_island_slug
-        .clone()
-        .unwrap_or_else(|| "global".to_string());
+    let current_scope_key = format!(
+        "{}::{}",
+        session_id,
+        selected_island_slug.clone().unwrap_or_else(|| "global".to_string())
+    );
     {
         let hist = get_recent_turns().lock().await;
         let scoped_turns: Vec<_> = hist
@@ -574,9 +587,11 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
 
     // Consolidación de Memoria (100% en la Isla Personalizada si está activa, o en el Hipocampo Global)
     if !final_clean_answer.trim().is_empty() {
-        let final_scope = selected_island_slug
-            .clone()
-            .unwrap_or_else(|| "global".to_string());
+        let final_scope = format!(
+            "{}::{}",
+            session_id,
+            selected_island_slug.clone().unwrap_or_else(|| "global".to_string())
+        );
         {
             let mut hist = get_recent_turns().lock().await;
             if hist.len() >= 18 {
