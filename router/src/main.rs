@@ -18,7 +18,7 @@ use quiron::{QuironShield, TriggerReason};
 use sandbox::FrictionChamber;
 use thought_buffer::ThoughtBuffer;
 use tools::AgentToolkit;
-use vector_db::causal_plane::{CausalHypergraph, CausalRelation, VectorThalamus};
+use vector_db::causal_plane::{CausalHypergraph, CausalRelation, DynamicIslandManager, VectorThalamus};
 use vector_db::common::types::IslandCategory;
 use vector_db::ingestion::embedder::NativeEmbedder;
 use vector_db::HippocampusEngine;
@@ -182,7 +182,9 @@ async fn main() {
     }
 
     // Iniciar Servidor Puente para AXIS UI en 127.0.0.1:8086
+    let custom_islands = Arc::new(DynamicIslandManager::new(Some("bob_custom_islands.bin")));
     let shared_state = Arc::new(server::BobSharedState {
+        custom_islands: Arc::clone(&custom_islands),
         hippocampus: Arc::clone(&hippocampus),
         embedder: Arc::clone(&embedder),
         thalamus: Arc::clone(&thalamus),

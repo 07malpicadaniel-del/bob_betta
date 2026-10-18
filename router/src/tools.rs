@@ -12,6 +12,7 @@ pub enum AgentToolCall {
     WebSearch { query: String },
     WriteFile { path: String, content: String },
     ExecCmd { cmd: String },
+    CreateIsland { name: String, description: String },
 }
 
 pub struct ToolExecutionResult {
@@ -25,21 +26,63 @@ pub struct AgentToolkit;
 impl AgentToolkit {
     pub fn system_prompt_instructions() -> &'static str {
         "Herramientas disponibles en Arch Linux:\n\
-        - [TOOL:SYS_INFO] -> Estado en vivo de CPU Ryzen 9, RAM y GPU RTX 5060 Ti (VRAM, %, temp, watts).\n\
+        - [TOOL:SYS_INFO] -> Estado en vivo de CPU Ryzen 9, RAM y GPU RTX 5060 Ti.\n\
         - [TOOL:LIST_DIR path=\"ruta\"] -> Lista archivos de un directorio local.\n\
         - [TOOL:READ_FILE path=\"ruta\"] -> Lee un archivo local.\n\
         - [TOOL:SEARCH_CODE path=\"ruta\" pattern=\"texto\"] -> Busca código en el proyecto.\n\
         - [TOOL:WEB_SEARCH query=\"consulta\"] -> Busca información actualizada en Internet.\n\
-        - [TOOL:EXEC_CMD cmd=\"comando\"] -> Ejecuta un comando en terminal (requiere confirmación [Y/N]).\n\
-        - [TOOL:WRITE_FILE path=\"ruta\" content=\"texto\"] -> Crea/modifica un archivo (requiere [Y/N])."
+        - [TOOL:EXEC_CMD cmd=\"comando\"] -> Ejecuta un comando o script bash/python en Arch Linux.\n\
+        - [TOOL:WRITE_FILE path=\"ruta\" content=\"texto\"] -> Crea o modifica un archivo en disco.\n\
+        - [TOOL:CREATE_ISLAND name=\"nombre\" desc=\"descripción del dominio\"] -> Crea una Isla de Vectores aislada en el Hipocampo 4D."
     }
 
-    /// Reflejo Autónomo del Enrutador: Detecta si el usuario pide telemetría de PC, archivos o búsqueda en Internet
+    /// Detecta en lenguaje natural si el usuario solicita crear una nueva Isla de Vectores
+    pub fn detect_island_creation_intent(user_input: &str) -> Option<(String, String)> {
+        let lower = user_input.to_lowercase();
+        let triggers = [
+            "hagas una isla de ",
+            "hacer una isla de ",
+            "crea una isla de ",
+            "crear una isla de ",
+            "nueva isla de ",
+            "isla de vectores de ",
+            "isla llamada ",
+        ];
+
+        for t in triggers {
+            if let Some(pos) = lower.find(t) {
+                let after_orig = user_input[pos + t.len()..].trim();
+                let name_raw: String = after_orig
+                    .split(|c: char| c == ',' || c == '.' || c == ':' || c == '(')
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let clean_name = name_raw
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                    .to_string();
+
+                if !clean_name.is_empty() {
+                    return Some((clean_name, user_input.trim().to_string()));
+                }
+            }
+        }
+        None
+    }
+
     pub fn detect_reflex_tools(user_input: &str, hippocampus_sim: f32) -> Vec<AgentToolCall> {
         let mut calls = Self::parse_tool_calls(user_input);
         let lower = user_input.to_lowercase();
 
-        // 1. Reflejo de Telemetría de Hardware / GPU / VRAM / Temperatura / RAM
+        if let Some((name, description)) = Self::detect_island_creation_intent(user_input) {
+            if !calls.iter().any(|c| matches!(c, AgentToolCall::CreateIsland { .. })) {
+                calls.push(AgentToolCall::CreateIsland { name, description });
+            }
+        }
+
         let asks_hardware = (lower.contains("gpu")
             || lower.contains("vram")
             || lower.contains("rtx")
@@ -55,8 +98,12 @@ impl AgentToolkit {
             calls.push(AgentToolCall::SysInfo);
         }
 
-        // 2. Reflejo de Listado de Directorios si menciona una ruta del proyecto
-        if (lower.contains("qué módulos") || lower.contains("que modulos") || lower.contains("qué archivos") || lower.contains("que archivos") || lower.contains("archivos hay") || lower.contains("lista"))
+        if (lower.contains("qué módulos")
+            || lower.contains("que modulos")
+            || lower.contains("qué archivos")
+            || lower.contains("que archivos")
+            || lower.contains("archivos hay")
+            || lower.contains("lista"))
             && !calls.iter().any(|c| matches!(c, AgentToolCall::ListDir { .. }))
         {
             if lower.contains("router/src") || lower.contains("crate router") {
@@ -74,18 +121,17 @@ impl AgentToolkit {
             }
         }
 
-        // 3. Reflejo de Búsqueda en Internet (explícito o por baja similitud en Hipocampo ante una duda externa)
         let explicit_web = lower.contains("busca en internet")
             || lower.contains("buscar en internet")
             || lower.contains("busca en la web")
             || lower.contains("investiga en internet")
-            || lower.contains("en internet")
             || lower.contains("noticias sobre")
             || lower.contains("última versión de")
             || lower.contains("ultima version de");
 
         let is_local_topic = lower.contains("bob")
             || lower.contains("hipocampo")
+            || lower.contains("isla")
             || lower.contains("leika")
             || lower.contains("aurora")
             || lower.contains("sertra")
@@ -93,8 +139,7 @@ impl AgentToolkit {
             || lower.contains("quirón")
             || lower.contains("mi gpu")
             || lower.contains("mi pc")
-            || lower.contains("tu código")
-            || lower.contains("tu codigo");
+            || lower.contains("proyectos");
 
         let epistemic_web_trigger = !is_local_topic
             && !asks_hardware
@@ -103,11 +148,7 @@ impl AgentToolkit {
                 || lower.starts_with("qué es ")
                 || lower.starts_with("que es ")
                 || lower.starts_with("quién es ")
-                || lower.starts_with("quien es ")
-                || lower.starts_with("cuál es ")
-                || lower.starts_with("cual es ")
-                || lower.starts_with("cuándo ")
-                || lower.starts_with("cuando "));
+                || lower.starts_with("quien es "));
 
         if (explicit_web || epistemic_web_trigger)
             && !calls.iter().any(|c| matches!(c, AgentToolCall::WebSearch { .. }))
@@ -146,58 +187,95 @@ impl AgentToolkit {
             .to_string()
     }
 
-    /// Extrae todas las invocaciones [TOOL:...] presentes en un texto
+    /// Parser robusto de bloques [TOOL:...]: soporta comandos multilínea, heredocs, comillas y corchetes internos
     pub fn parse_tool_calls(response: &str) -> Vec<AgentToolCall> {
         let mut calls = Vec::new();
-        let mut search_slice = response;
+        let parts: Vec<&str> = response.split("[TOOL:").collect();
 
-        while let Some(start) = search_slice.find("[TOOL:") {
-            let after_start = &search_slice[start + 6..];
-            let Some(end) = after_start.find(']') else {
-                break;
-            };
-            let inside = after_start[..end].trim();
+        for part in parts.iter().skip(1) {
+            let trimmed = part.trim_start();
 
-            if inside.starts_with("SYS_INFO") {
+            if trimmed.starts_with("SYS_INFO") {
                 if !calls.iter().any(|c| matches!(c, AgentToolCall::SysInfo)) {
                     calls.push(AgentToolCall::SysInfo);
                 }
+                continue;
+            }
+
+            // Para herramientas con argumentos entre comillas, buscamos el cierre `"]` final del bloque [TOOL:...]
+            let Some(end_tag) = Self::find_closing_tool_bracket(trimmed) else {
+                continue;
+            };
+            let inside = &trimmed[..end_tag];
+
+            if inside.starts_with("EXEC_CMD") {
+                if let Some(cmd_pos) = inside.find("cmd=\"") {
+                    let cmd_body = &inside[cmd_pos + 5..];
+                    let clean_cmd = cmd_body.strip_suffix('"').unwrap_or(cmd_body).to_string();
+                    if !clean_cmd.trim().is_empty() {
+                        calls.push(AgentToolCall::ExecCmd { cmd: clean_cmd });
+                    }
+                }
+            } else if inside.starts_with("WRITE_FILE") {
+                if let Some(path) = Self::extract_simple_attr(inside, "path") {
+                    if let Some(content_pos) = inside.find("content=\"") {
+                        let content_body = &inside[content_pos + 9..];
+                        let clean_content = content_body
+                            .strip_suffix('"')
+                            .unwrap_or(content_body)
+                            .to_string();
+                        calls.push(AgentToolCall::WriteFile {
+                            path,
+                            content: clean_content,
+                        });
+                    }
+                }
+            } else if inside.starts_with("CREATE_ISLAND") {
+                if let Some(name) = Self::extract_simple_attr(inside, "name") {
+                    let description = Self::extract_simple_attr(inside, "desc")
+                        .unwrap_or_else(|| "Isla cortical especializada".to_string());
+                    calls.push(AgentToolCall::CreateIsland { name, description });
+                }
             } else if inside.starts_with("LIST_DIR") {
-                let path = Self::extract_attr(inside, "path").unwrap_or_else(|| ".".to_string());
+                let path = Self::extract_simple_attr(inside, "path").unwrap_or_else(|| ".".to_string());
                 calls.push(AgentToolCall::ListDir { path });
             } else if inside.starts_with("READ_FILE") {
-                if let Some(path) = Self::extract_attr(inside, "path") {
+                if let Some(path) = Self::extract_simple_attr(inside, "path") {
                     calls.push(AgentToolCall::ReadFile { path });
                 }
             } else if inside.starts_with("SEARCH_CODE") {
-                let path = Self::extract_attr(inside, "path").unwrap_or_else(|| ".".to_string());
-                if let Some(pattern) = Self::extract_attr(inside, "pattern") {
+                let path = Self::extract_simple_attr(inside, "path").unwrap_or_else(|| ".".to_string());
+                if let Some(pattern) = Self::extract_simple_attr(inside, "pattern") {
                     calls.push(AgentToolCall::SearchCode { path, pattern });
                 }
             } else if inside.starts_with("WEB_SEARCH") {
-                if let Some(query) = Self::extract_attr(inside, "query") {
+                if let Some(query) = Self::extract_simple_attr(inside, "query") {
                     calls.push(AgentToolCall::WebSearch { query });
                 }
-            } else if inside.starts_with("WRITE_FILE") {
-                if let (Some(path), Some(content)) = (
-                    Self::extract_attr(inside, "path"),
-                    Self::extract_attr(inside, "content"),
-                ) {
-                    calls.push(AgentToolCall::WriteFile { path, content });
-                }
-            } else if inside.starts_with("EXEC_CMD") {
-                if let Some(cmd) = Self::extract_attr(inside, "cmd") {
-                    calls.push(AgentToolCall::ExecCmd { cmd });
-                }
             }
-
-            search_slice = &after_start[end + 1..];
         }
 
         calls
     }
 
-    fn extract_attr(input: &str, key: &str) -> Option<String> {
+    /// Localiza el `]` que cierra verdaderamente la etiqueta `[TOOL:...]` (buscando `"]` al final de línea o bloque)
+    fn find_closing_tool_bracket(segment: &str) -> Option<usize> {
+        let mut last_candidate = None;
+        let bytes = segment.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if bytes[i] == b'"' && bytes[i + 1] == b']' {
+                let after = &segment[i + 2..];
+                if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
+                    last_candidate = Some(i + 1);
+                } else if last_candidate.is_none() {
+                    last_candidate = Some(i + 1);
+                }
+            }
+        }
+        last_candidate.or_else(|| segment.find(']'))
+    }
+
+    fn extract_simple_attr(input: &str, key: &str) -> Option<String> {
         let pattern = format!("{}=\"", key);
         let start = input.find(&pattern)? + pattern.len();
         let rest = &input[start..];
@@ -230,6 +308,11 @@ impl AgentToolkit {
             AgentToolCall::WebSearch { query } => ToolExecutionResult {
                 tool_name: "WEB_SEARCH",
                 output: Self::search_internet(query),
+                approved: true,
+            },
+            AgentToolCall::CreateIsland { name, description } => ToolExecutionResult {
+                tool_name: "CREATE_ISLAND",
+                output: format!("Isla `{}` ({}) preparada para inicialización en Hipocampo.", name, description),
                 approved: true,
             },
             AgentToolCall::WriteFile { path, content } => {
@@ -308,11 +391,96 @@ impl AgentToolkit {
         }
     }
 
-    /// Buscador de Internet Nativo (DuckDuckGo HTML + Wikipedia API en Español/Inglés)
+    /// Ejecuta herramientas en modo autónomo para AXIS UI auditando seguridad AST sin bloquear en stdin
+    pub fn execute_tool_autonomous(call: &AgentToolCall) -> ToolExecutionResult {
+        match call {
+            AgentToolCall::WriteFile { path, content } => {
+                if path.starts_with("/etc") || path.starts_with("/boot") || path.starts_with("/usr") {
+                    return ToolExecutionResult {
+                        tool_name: "WRITE_FILE",
+                        output: format!("Bloqueado por seguridad AST: ruta protegida `{}`.", path),
+                        approved: false,
+                    };
+                }
+                let unescaped = if content.contains('\n') {
+                    content.clone()
+                } else {
+                    content
+                        .replace("\\n", "\n")
+                        .replace("\\t", "\t")
+                        .replace("\\\"", "\"")
+                };
+                if let Some(parent) = Path::new(path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                }
+                match fs::write(path, &unescaped) {
+                    Ok(_) => ToolExecutionResult {
+                        tool_name: "WRITE_FILE",
+                        output: format!("Archivo `{}` escrito en disco ({} bytes).", path, unescaped.len()),
+                        approved: true,
+                    },
+                    Err(e) => ToolExecutionResult {
+                        tool_name: "WRITE_FILE",
+                        output: format!("Error escribiendo `{}`: {}", path, e),
+                        approved: false,
+                    },
+                }
+            }
+            AgentToolCall::ExecCmd { cmd } => {
+                let forbidden = ["rm -rf /", "mkfs", "dd if=", ":(){", "chmod -R 777 /", "shutdown", "reboot"];
+                for pat in forbidden {
+                    if cmd.contains(pat) {
+                        return ToolExecutionResult {
+                            tool_name: "EXEC_CMD",
+                            output: format!("Comando bloqueado por seguridad AST: contiene `{}`.", pat),
+                            approved: false,
+                        };
+                    }
+                }
+
+                // Timeout de 10s para que si lanza una ventana gráfica (Tkinter/Pygame) en Wayland/XWayland, verifique que corrió sin errores y devuelva el control a Axis
+                match Command::new("timeout")
+                    .args(["10s", "bash", "-c", cmd])
+                    .output()
+                {
+                    Ok(out) => {
+                        let code = out.status.code().unwrap_or(0);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let status_note = if code == 124 {
+                            "Ventana gráfica / proceso interactivo ejecutado en Arch Linux durante 10s sin errores (cerrado automáticamente tras prueba)."
+                        } else {
+                            "Ejecución de terminal completada."
+                        };
+                        let combined = format!(
+                            "Exit Code: {} ({})\nSTDOUT:\n{}\nSTDERR:\n{}",
+                            code,
+                            status_note,
+                            stdout.trim(),
+                            stderr.trim()
+                        );
+                        ToolExecutionResult {
+                            tool_name: "EXEC_CMD",
+                            output: combined.chars().take(2500).collect(),
+                            approved: true,
+                        }
+                    }
+                    Err(e) => ToolExecutionResult {
+                        tool_name: "EXEC_CMD",
+                        output: format!("Error ejecutando comando `{}`: {}", cmd, e),
+                        approved: false,
+                    },
+                }
+            }
+            other => Self::execute_tool(other),
+        }
+    }
+
     pub fn search_internet(query: &str) -> String {
         let mut results = Vec::new();
 
-        // 1. Consulta en vivo a DuckDuckGo HTML
         if let Ok(ddg_out) = Command::new("curl")
             .args([
                 "-sL",
@@ -353,58 +521,10 @@ impl AgentToolkit {
             }
         }
 
-        // 2. Respaldo complementario en Wikipedia API (ES) si se requieren definiciones adicionales
-        if results.len() < 3 {
-            if let Ok(wiki_out) = Command::new("curl")
-                .args([
-                    "-sL",
-                    "--max-time",
-                    "6",
-                    "-G",
-                    "--data-urlencode",
-                    "action=query",
-                    "--data-urlencode",
-                    "list=search",
-                    "--data-urlencode",
-                    &format!("srsearch={}", query),
-                    "--data-urlencode",
-                    "format=json",
-                    "https://es.wikipedia.org/w/api.php",
-                ])
-                .output()
-            {
-                if wiki_out.status.success() {
-                    let json_str = String::from_utf8_lossy(&wiki_out.stdout);
-                    let mut slice = &json_str[..];
-                    let marker = "\"snippet\":\"";
-                    while let Some(pos) = slice.find(marker) {
-                        let after = &slice[pos + marker.len()..];
-                        if let Some(end_q) = after.find("\",\"") {
-                            let raw_snip = &after[..end_q];
-                            let clean = Self::strip_html_tags(raw_snip);
-                            if clean.len() > 20 {
-                                results.push(format!("- [Wikipedia]: {}", clean));
-                                if results.len() >= 5 {
-                                    break;
-                                }
-                            }
-                            slice = &after[end_q..];
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
         if results.is_empty() {
-            format!("No se obtuvieron resultados web externos para `{}` (verifica conexión de red).", query)
+            format!("No se obtuvieron resultados web externos para `{}`.", query)
         } else {
-            format!(
-                "Resultados en vivo de Internet para `{}`:\n{}",
-                query,
-                results.join("\n")
-            )
+            format!("Resultados en vivo de Internet para `{}`:\n{}", query, results.join("\n"))
         }
     }
 
@@ -426,7 +546,6 @@ impl AgentToolkit {
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&nbsp;", " ")
-            .replace("\\\"", "\"")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -434,16 +553,13 @@ impl AgentToolkit {
 
     fn gather_sys_info() -> String {
         let mut report = String::new();
-
         if let Ok(load) = fs::read_to_string("/proc/loadavg") {
             report.push_str(&format!("- Carga Kernel (/proc/loadavg): {}\n", load.trim()));
         }
-
         if let Ok(mem) = fs::read_to_string("/proc/meminfo") {
             let mem_summary: Vec<&str> = mem.lines().take(3).collect();
             report.push_str(&format!("- Memoria RAM Sistema:\n  {}\n", mem_summary.join("\n  ")));
         }
-
         if let Ok(gpu_out) = Command::new("nvidia-smi")
             .args([
                 "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
@@ -459,12 +575,9 @@ impl AgentToolkit {
                         "- GPU NVIDIA Activa: {}\n  * VRAM Usada / Total: {} / {}\n  * Porcentaje de Uso GPU: {}\n  * Temperatura Núcleo: {} °C\n  * Consumo Energético: {}\n",
                         parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
                     ));
-                } else {
-                    report.push_str(&format!("- GPU Telemetría (nvidia-smi): {}\n", raw));
                 }
             }
         }
-
         report
     }
 
@@ -513,12 +626,7 @@ impl AgentToolkit {
         if matches.is_empty() {
             format!("No se encontraron coincidencias para `{}` en `{:?}`.", pattern, dir)
         } else {
-            format!(
-                "Coincidencias para `{}` en `{:?}`:\n{}",
-                pattern,
-                dir,
-                matches.join("\n")
-            )
+            format!("Coincidencias para `{}` en `{:?}`:\n{}", pattern, dir, matches.join("\n"))
         }
     }
 

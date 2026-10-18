@@ -28,11 +28,11 @@ impl Default for CortexConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8085,
-            n_predict: 1024,
+            n_predict: 2048,
             temperature: 0.2,
             slot_id: 0,
             n_gpu_layers: 99,
-            ctx_size: 4096,
+            ctx_size: 8192,
             batch_size: 512,
             server_bin: workspace_root.join("llama.cpp/build/bin/llama-server"),
             model_path: workspace_root.join("models/Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf"),
