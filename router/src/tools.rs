@@ -13,6 +13,9 @@ pub enum AgentToolCall {
     WriteFile { path: String, content: String },
     ExecCmd { cmd: String },
     CreateIsland { name: String, description: String },
+    AskGemini { query: String },
+    BrowserInspect,
+    BrowserClick { text: String },
 }
 
 pub struct ToolExecutionResult {
@@ -33,10 +36,12 @@ impl AgentToolkit {
         - [TOOL:WEB_SEARCH query=\"consulta\"] -> Busca información actualizada en Internet.\n\
         - [TOOL:EXEC_CMD cmd=\"comando\"] -> Ejecuta un comando o script bash/python en Arch Linux.\n\
         - [TOOL:WRITE_FILE path=\"ruta\" content=\"texto\"] -> Crea o modifica un archivo en disco.\n\
-        - [TOOL:CREATE_ISLAND name=\"nombre\" desc=\"descripción del dominio\"] -> Crea una Isla de Vectores aislada en el Hipocampo 4D."
+        - [TOOL:CREATE_ISLAND name=\"nombre\" desc=\"descripción\"] -> Crea una Isla de Vectores aislada en el Hipocampo 4D.\n\
+        - [TOOL:ASK_GEMINI query=\"pregunta técnica\"] -> Consulta directamente a Gemini en el navegador de Daniel (Sinapsis Quirón Segura).\n\
+        - [TOOL:BROWSER_INSPECT] -> Lee el contenido, preguntas y botones de la pestaña activa del navegador de Daniel (útil para quizes).\n\
+        - [TOOL:BROWSER_CLICK text=\"texto de la opción\"] -> Hace clic en una respuesta o botón dentro del navegador de Daniel."
     }
 
-    /// Detecta en lenguaje natural si el usuario solicita crear una nueva Isla de Vectores
     pub fn detect_island_creation_intent(user_input: &str) -> Option<(String, String)> {
         let lower = user_input.to_lowercase();
         let triggers = [
@@ -187,7 +192,6 @@ impl AgentToolkit {
             .to_string()
     }
 
-    /// Parser robusto de bloques [TOOL:...]: soporta comandos multilínea, heredocs, comillas y corchetes internos
     pub fn parse_tool_calls(response: &str) -> Vec<AgentToolCall> {
         let mut calls = Vec::new();
         let parts: Vec<&str> = response.split("[TOOL:").collect();
@@ -201,8 +205,11 @@ impl AgentToolkit {
                 }
                 continue;
             }
+            if trimmed.starts_with("BROWSER_INSPECT") {
+                calls.push(AgentToolCall::BrowserInspect);
+                continue;
+            }
 
-            // Para herramientas con argumentos entre comillas, buscamos el cierre `"]` final del bloque [TOOL:...]
             let Some(end_tag) = Self::find_closing_tool_bracket(trimmed) else {
                 continue;
             };
@@ -252,13 +259,20 @@ impl AgentToolkit {
                 if let Some(query) = Self::extract_simple_attr(inside, "query") {
                     calls.push(AgentToolCall::WebSearch { query });
                 }
+            } else if inside.starts_with("ASK_GEMINI") {
+                if let Some(query) = Self::extract_simple_attr(inside, "query") {
+                    calls.push(AgentToolCall::AskGemini { query });
+                }
+            } else if inside.starts_with("BROWSER_CLICK") {
+                if let Some(text) = Self::extract_simple_attr(inside, "text") {
+                    calls.push(AgentToolCall::BrowserClick { text });
+                }
             }
         }
 
         calls
     }
 
-    /// Localiza el `]` que cierra verdaderamente la etiqueta `[TOOL:...]` (buscando `"]` al final de línea o bloque)
     fn find_closing_tool_bracket(segment: &str) -> Option<usize> {
         let mut last_candidate = None;
         let bytes = segment.as_bytes();
@@ -313,6 +327,21 @@ impl AgentToolkit {
             AgentToolCall::CreateIsland { name, description } => ToolExecutionResult {
                 tool_name: "CREATE_ISLAND",
                 output: format!("Isla `{}` ({}) preparada para inicialización en Hipocampo.", name, description),
+                approved: true,
+            },
+            AgentToolCall::AskGemini { query } => ToolExecutionResult {
+                tool_name: "ASK_GEMINI",
+                output: Self::run_browser_script("ask_gemini", query),
+                approved: true,
+            },
+            AgentToolCall::BrowserInspect => ToolExecutionResult {
+                tool_name: "BROWSER_INSPECT",
+                output: Self::run_browser_script("inspect", ""),
+                approved: true,
+            },
+            AgentToolCall::BrowserClick { text } => ToolExecutionResult {
+                tool_name: "BROWSER_CLICK",
+                output: Self::run_browser_script("click", text),
                 approved: true,
             },
             AgentToolCall::WriteFile { path, content } => {
@@ -391,7 +420,6 @@ impl AgentToolkit {
         }
     }
 
-    /// Ejecuta herramientas en modo autónomo para AXIS UI auditando seguridad AST sin bloquear en stdin
     pub fn execute_tool_autonomous(call: &AgentToolCall) -> ToolExecutionResult {
         match call {
             AgentToolCall::WriteFile { path, content } => {
@@ -440,9 +468,21 @@ impl AgentToolkit {
                     }
                 }
 
-                // Timeout de 10s para que si lanza una ventana gráfica (Tkinter/Pygame) en Wayland/XWayland, verifique que corrió sin errores y devuelva el control a Axis
+                let is_heavy_build = cmd.contains("gradle")
+                    || cmd.contains("cargo")
+                    || cmd.contains("adb ")
+                    || cmd.contains("pacman")
+                    || cmd.contains("pnpm")
+                    || cmd.contains("npm")
+                    || cmd.contains("pip ");
+                let timeout_dur = if is_heavy_build { "120s" } else { "15s" };
+                let env_wrapped_cmd = format!(
+                    "export JAVA_HOME=/opt/android-studio/jbr; export ANDROID_HOME=$HOME/Android/Sdk; export PATH=$PATH:$ANDROID_HOME/platform-tools:$JAVA_HOME/bin; {}",
+                    cmd
+                );
+
                 match Command::new("timeout")
-                    .args(["10s", "bash", "-c", cmd])
+                    .args([timeout_dur, "bash", "-c", &env_wrapped_cmd])
                     .output()
                 {
                     Ok(out) => {
@@ -475,6 +515,26 @@ impl AgentToolkit {
                 }
             }
             other => Self::execute_tool(other),
+        }
+    }
+
+    pub fn run_browser_script(mode: &str, arg: &str) -> String {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
+        let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
+        let script = format!("{}/proyectos/bob_engine/scripts/bob_browser_bridge.py", home);
+        let python_cmd = if Path::new(&py_bin).exists() {
+            py_bin
+        } else {
+            "python3".to_string()
+        };
+
+        match Command::new(&python_cmd).args([&script, mode, arg]).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string()
+            }
+            Err(e) => format!("Error ejecutando puente de navegador: {}", e),
         }
     }
 

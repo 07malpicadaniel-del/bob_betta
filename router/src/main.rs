@@ -1,3 +1,4 @@
+mod marathon;
 mod ecosystem_seed;
 mod server;
 mod abe;
