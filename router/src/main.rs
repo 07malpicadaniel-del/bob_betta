@@ -1,3 +1,5 @@
+mod browser_cdp;
+mod skills;
 mod marathon;
 mod ecosystem_seed;
 mod server;

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "36d6dc40-f200-4a50-a9d2-db15941f18e3",
+    "name": "axis_v1",
+    "path": "/home/daniel/proyectos/bob_engine",
+    "current_branch": "main",
+    "is_clean": false,
+    "last_commit": "mejora de ui",
+    "last_commit_time": "2 days ago",
+    "tag": "Rust / React"
+  }
+]

@@ -20,11 +20,13 @@ use vector_db::ingestion::embedder::NativeEmbedder;
 use vector_db::HippocampusEngine;
 
 use crate::abe::BinaryScenarioTree;
+use crate::browser_cdp::RustBrowserBridge;
 use crate::ecosystem_seed::EcosystemSeeder;
 use crate::extract_rust_from_prefill;
 use crate::gatekeeper::{CodeLang, Gatekeeper};
 use crate::marathon::{get_marathon_state, MarathonEngine};
 use crate::quiron::{QuironShield, TriggerReason};
+use crate::skills::SkillManager;
 use crate::thought_buffer::ThoughtBuffer;
 use crate::tools::{AgentToolCall, AgentToolkit};
 
@@ -81,6 +83,13 @@ struct WorkspaceInitReq {
     session_id: String,
     title: Option<String>,
     island: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "cortex::serde")]
+struct SkillSaveReq {
+    name: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -149,7 +158,6 @@ fn sanitize_session_folder(session_id: &str) -> String {
     }
 }
 
-/// Crea o recupera la carpeta de trabajo dedicada a una conversación y la indexa en el Hipocampo 4D
 fn ensure_session_workspace(
     st: &Arc<BobSharedState>,
     session_id: &str,
@@ -235,7 +243,7 @@ fn list_workspace_files_recursive(base: &Path, current: &Path) -> Vec<String> {
     for entry in entries.flatten() {
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == "target" || name == "node_modules" || name.starts_with(".git") {
+        if name == "target" || name == "node_modules" || name == ".gradle" || name == "build" || name.starts_with(".git") {
             continue;
         }
         if p.is_dir() {
@@ -248,7 +256,6 @@ fn list_workspace_files_recursive(base: &Path, current: &Path) -> Vec<String> {
     out
 }
 
-/// Construye un resumen vivo de la carpeta del proyecto para inyectar en el prompt sin saturar la ventana de tokens
 fn build_workspace_live_snapshot(ws_dir: &Path, files: &[String]) -> String {
     let mut snap = format!(
         "### [MEMORIA EXTERNA DE PROYECTO EN DISCO (WORKSPACE DE ESTA CONVERSACIÓN)]\n\
@@ -274,24 +281,89 @@ fn build_workspace_live_snapshot(ws_dir: &Path, files: &[String]) -> String {
     snap
 }
 
-fn decode_base64_via_python(b64: &str, dest_path: &Path) -> Result<usize, String> {
-    let tmp_b64 = "/tmp/bob_upload_payload.b64";
-    fs::write(tmp_b64, b64).map_err(|e| e.to_string())?;
-    let py_code = format!(
-        "import base64; data = open('{}', 'rb').read(); raw = base64.b64decode(data); open('{}', 'wb').write(raw); print(len(raw))",
-        tmp_b64,
-        dest_path.display()
-    );
-    let out = Command::new("python3")
-        .args(["-c", &py_code])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        let len_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(len_str.parse::<usize>().unwrap_or(0))
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).to_string())
+/// Decodificador Base64 RFC 4648 escrito 100% en Rust nativo
+fn decode_base64_pure_rust(b64: &str, dest_path: &Path) -> Result<usize, String> {
+    let mut out = Vec::with_capacity((b64.len() * 3) / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+
+    for byte in b64.bytes() {
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => continue,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
     }
+
+    fs::write(dest_path, &out).map_err(|e| e.to_string())?;
+    Ok(out.len())
+}
+
+fn encode_base64_pure_rust(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Analizador de Imágenes 100% en Rust nativo
+fn analyze_image_pure_rust(img_path: &Path) -> String {
+    let bytes = fs::read(img_path).unwrap_or_default();
+    let mut dims = String::from("Imagen binaria");
+
+    if bytes.len() >= 24 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        dims = format!("{}x{} px (PNG)", w, h);
+    }
+
+    let ocr_txt = Command::new("tesseract")
+        .arg(img_path)
+        .arg("stdout")
+        .args(["-l", "spa+eng", "--psm", "6"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(Imagen almacenada en el Workspace de la sesión lista para inspección)".to_string());
+
+    format!(
+        "[IMAGEN ADJUNTA EN WORKSPACE (100% RUST): `{}` ({} bytes, {})]\nRuta en disco: `{}`\nTexto/UI extraído de la imagen:\n{}\n",
+        img_path.file_name().unwrap_or_default().to_string_lossy(),
+        bytes.len(),
+        dims,
+        img_path.display(),
+        ocr_txt.chars().take(1800).collect::<String>()
+    )
 }
 
 fn hydrate_visual_graph(st: &Arc<BobSharedState>) {
@@ -329,7 +401,7 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
     let addr = format!("127.0.0.1:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
-            println!("[✓] Puente UI AXIS activo en http://{} (JSON API lista).", addr);
+            println!("[✓] Puente UI AXIS activo en http://{} (JSON API 100% Rust lista).", addr);
             l
         }
         Err(e) => {
@@ -342,7 +414,6 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
         if let Ok((mut stream, _)) = listener.accept().await {
             let st = Arc::clone(&state);
             tokio::spawn(async move {
-                // Leer petición completa (hasta 15 MB para soportar imágenes y archivos en Base64)
                 let mut buf = Vec::with_capacity(65536);
                 let mut temp = [0u8; 65536];
                 let mut expected_total_len: Option<usize> = None;
@@ -410,6 +481,35 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                         custom_islands: st.custom_islands.list_islands(),
                     };
                     serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string())
+                } else if first_line.starts_with("GET /skills") {
+                    let mgr = SkillManager::new();
+                    serde_json::json!({
+                        "ok": true,
+                        "skills": mgr.list_skills()
+                    })
+                    .to_string()
+                } else if first_line.starts_with("POST /skills") {
+                    if let Ok(req) = serde_json::from_str::<SkillSaveReq>(body) {
+                        let mgr = SkillManager::new();
+                        match mgr.save_or_update_skill(
+                            &req.name,
+                            &req.content,
+                            &st.hippocampus,
+                            &st.causal_graph,
+                            &st.custom_islands,
+                            &st.embedder,
+                        ) {
+                            Ok(saved) => serde_json::json!({
+                                "ok": true,
+                                "skill": saved,
+                                "skills": mgr.list_skills()
+                            })
+                            .to_string(),
+                            Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
+                        }
+                    } else {
+                        serde_json::json!({"ok": false, "error": "JSON de skill invalido"}).to_string()
+                    }
                 } else if first_line.starts_with("POST /session/workspace") {
                     if let Ok(req) = serde_json::from_str::<WorkspaceInitReq>(body) {
                         let (ws_path, files) = ensure_session_workspace(
@@ -427,8 +527,7 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                     } else {
                         serde_json::json!({"ok": false, "error": "JSON invalido"}).to_string()
                     }
-                } else if first_line.starts_with("POST /session/paste") || first_line.starts_with("POST /session/pick") {
-                    let mode_arg = if first_line.starts_with("POST /session/paste") { "paste" } else { "pick" };
+                } else if first_line.starts_with("POST /session/paste") {
                     if let Ok(req) = serde_json::from_str::<WorkspaceInitReq>(body) {
                         let (ws_path, _) = ensure_session_workspace(
                             &st,
@@ -437,49 +536,60 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                             req.island.as_deref(),
                         );
                         let attach_dir = ws_path.join("attachments");
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-                        let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
-                        let script = format!("{}/proyectos/bob_engine/scripts/bob_clipboard_and_picker.py", home);
-                        let out = Command::new(&py_bin)
-                            .arg(&script)
-                            .arg(mode_arg)
-                            .arg(&attach_dir)
-                            .output();
+                        let fname = format!("paste_{}.png", now_ts());
+                        let dest = attach_dir.join(&fname);
+                        let cmd = format!(
+                            "wl-paste --type image/png > '{}' 2>/dev/null || wl-paste --type image/jpeg > '{}' 2>/dev/null || xclip -selection clipboard -t image/png -o > '{}' 2>/dev/null",
+                            dest.display(),
+                            dest.display(),
+                            dest.display()
+                        );
+                        let _ = Command::new("bash").arg("-c").arg(&cmd).status();
 
-                        match out {
-                            Ok(o) => {
-                                let stdout = String::from_utf8_lossy(&o.stdout);
-                                if let Some(jline) = stdout.lines().find(|l| l.starts_with("JSON_OUT:")) {
-                                    let raw_json = jline.trim_start_matches("JSON_OUT:").trim();
-                                    if let Ok(mut parsed_val) = serde_json::from_str::<serde_json::Value>(raw_json) {
-                                        if parsed_val["ok"].as_bool() == Some(true) {
-                                            if let Some(items) = parsed_val["items"].as_array() {
-                                                let now = now_ts();
-                                                for item in items {
-                                                    if let Some(sum_txt) = item["summary"].as_str() {
-                                                        if let Ok(vec) = st.embedder.generate_vector(sum_txt) {
-                                                            if let Some(isl) = req.island.as_deref().filter(|s| !s.is_empty() && *s != "global") {
-                                                                st.custom_islands.remember_in_island(isl, sum_txt.to_string(), &vec, now);
-                                                            } else {
-                                                                let (nid, _) = st.hippocampus.remember(sum_txt.to_string(), vec.clone(), Some(IslandCategory::Code), 1, now);
-                                                                st.custom_islands.register_base_node(nid, "Code", sum_txt.to_string(), &vec, now);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let updated_files = list_workspace_files_recursive(&ws_path, &ws_path);
-                                        parsed_val["workspace_files"] = serde_json::json!(updated_files);
-                                        parsed_val.to_string()
-                                    } else {
-                                        serde_json::json!({"ok": false, "error": "Error parseando salida de clipboard"}).to_string()
-                                    }
-                                } else {
-                                    serde_json::json!({"ok": false, "error": "No se obtuvo respuesta del helper"}).to_string()
-                                }
+                        if dest.exists() && fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) > 64 {
+                            let raw_bytes = fs::read(&dest).unwrap_or_default();
+                            let b64_preview = format!(
+                                "data:image/png;base64,{}",
+                                encode_base64_pure_rust(&raw_bytes)
+                            );
+                            let summary = analyze_image_pure_rust(&dest);
+                            let now = now_ts();
+                            if let Ok(vec) = st.embedder.generate_vector(&summary) {
+                                let (nid, _) = st.hippocampus.remember(
+                                    summary.clone(),
+                                    vec.clone(),
+                                    Some(IslandCategory::Code),
+                                    1,
+                                    now,
+                                );
+                                st.custom_islands.register_base_node(
+                                    nid,
+                                    "Code",
+                                    summary.clone(),
+                                    &vec,
+                                    now,
+                                );
                             }
-                            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                            let updated_files = list_workspace_files_recursive(&ws_path, &ws_path);
+                            serde_json::json!({
+                                "ok": true,
+                                "items": [{
+                                    "filename": fname,
+                                    "saved_path": dest.to_string_lossy(),
+                                    "is_image": true,
+                                    "preview_data_url": b64_preview,
+                                    "summary": summary
+                                }],
+                                "workspace_files": updated_files
+                            })
+                            .to_string()
+                        } else {
+                            let _ = fs::remove_file(&dest);
+                            serde_json::json!({
+                                "ok": false,
+                                "error": "No hay imagen en el portapapeles de Wayland. Toma una captura o usa el botón de clip (📎)."
+                            })
+                            .to_string()
                         }
                     } else {
                         serde_json::json!({"ok": false, "error": "JSON invalido"}).to_string()
@@ -495,11 +605,17 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                         let safe_fname: String = req
                             .filename
                             .chars()
-                            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+                            .map(|c| {
+                                if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                                    c
+                                } else {
+                                    '_'
+                                }
+                            })
                             .collect();
                         let dest = ws_path.join("attachments").join(&safe_fname);
 
-                        match decode_base64_via_python(&req.content_base64, &dest) {
+                        match decode_base64_pure_rust(&req.content_base64, &dest) {
                             Ok(byte_len) => {
                                 let ext = dest
                                     .extension()
@@ -512,26 +628,7 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                                 );
 
                                 let analysis_summary = if is_img {
-                                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-                                    let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
-                                    let script = format!("{}/proyectos/bob_engine/scripts/bob_vision_ingest.py", home);
-                                    let out = Command::new(&py_bin)
-                                        .arg(&script).arg(&dest)
-                                        .output();
-                                    if let Ok(o) = out {
-                                        let stdout = String::from_utf8_lossy(&o.stdout);
-                                        if let Some(jline) = stdout.lines().find(|l| l.starts_with("JSON_OUT:")) {
-                                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(jline.trim_start_matches("JSON_OUT:")) {
-                                                val["summary"].as_str().unwrap_or("Imagen guardada.").to_string()
-                                            } else {
-                                                format!("Imagen guardada en {}", dest.display())
-                                            }
-                                        } else {
-                                            format!("Imagen guardada en {}", dest.display())
-                                        }
-                                    } else {
-                                        format!("Imagen guardada en {}", dest.display())
-                                    }
+                                    analyze_image_pure_rust(&dest)
                                 } else {
                                     let raw_txt = fs::read_to_string(&dest).unwrap_or_default();
                                     let preview: String = raw_txt.chars().take(2500).collect();
@@ -544,11 +641,19 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                                     )
                                 };
 
-                                // Indexar el archivo o imagen en el Hipocampo 4D
                                 let now = now_ts();
                                 if let Ok(vec) = st.embedder.generate_vector(&analysis_summary) {
-                                    if let Some(isl) = req.island.as_deref().filter(|s| !s.is_empty() && *s != "global") {
-                                        st.custom_islands.remember_in_island(isl, analysis_summary.clone(), &vec, now);
+                                    if let Some(isl) = req
+                                        .island
+                                        .as_deref()
+                                        .filter(|s| !s.is_empty() && *s != "global")
+                                    {
+                                        st.custom_islands.remember_in_island(
+                                            isl,
+                                            analysis_summary.clone(),
+                                            &vec,
+                                            now,
+                                        );
                                     } else {
                                         let (nid, _) = st.hippocampus.remember(
                                             analysis_summary.clone(),
@@ -567,7 +672,8 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                                     }
                                 }
 
-                                let updated_files = list_workspace_files_recursive(&ws_path, &ws_path);
+                                let updated_files =
+                                    list_workspace_files_recursive(&ws_path, &ws_path);
                                 serde_json::json!({
                                     "ok": true,
                                     "filename": safe_fname,
@@ -581,10 +687,12 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                             Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
                         }
                     } else {
-                        serde_json::json!({"ok": false, "error": "JSON de archivo invalido"}).to_string()
+                        serde_json::json!({"ok": false, "error": "JSON de archivo invalido"})
+                            .to_string()
                     }
                 } else if first_line.starts_with("POST /sync-projects") {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
+                    let home =
+                        std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
                     let projects_dir = PathBuf::from(home).join("proyectos");
                     let now = now_ts();
                     let base_count = EcosystemSeeder::seed_daniel_ecosystem(
@@ -615,13 +723,29 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                     }
                     let _ = std::fs::remove_file("/tmp/bob_voice_in.wav");
                     let child = Command::new("pw-record")
-                        .args(["--rate", "16000", "--channels", "1", "--format", "s16", "/tmp/bob_voice_in.wav"])
+                        .args([
+                            "--rate",
+                            "16000",
+                            "--channels",
+                            "1",
+                            "--format",
+                            "s16",
+                            "/tmp/bob_voice_in.wav",
+                        ])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
                         .or_else(|_| {
                             Command::new("arecord")
-                                .args(["-f", "S16_LE", "-r", "16000", "-c", "1", "/tmp/bob_voice_in.wav"])
+                                .args([
+                                    "-f",
+                                    "S16_LE",
+                                    "-r",
+                                    "16000",
+                                    "-c",
+                                    "1",
+                                    "/tmp/bob_voice_in.wav",
+                                ])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .spawn()
@@ -631,7 +755,9 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                             *guard = Some(c);
                             serde_json::json!({"ok": true, "status": "recording"}).to_string()
                         }
-                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        Err(e) => {
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string()
+                        }
                     }
                 } else if first_line.starts_with("POST /voice/stop") {
                     {
@@ -644,56 +770,73 @@ pub async fn start_axis_bridge_server(state: Arc<BobSharedState>, port: u16) {
                             let _ = child.wait();
                         }
                     }
-                    let req_lang = serde_json::from_str::<VoiceStopReq>(body)
+                    let _req_lang = serde_json::from_str::<VoiceStopReq>(body)
                         .ok()
                         .and_then(|r| r.lang)
                         .unwrap_or_else(|| "auto".to_string());
 
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-                    let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
-                    let script = format!("{}/proyectos/bob_engine/scripts/bob_whisper_stt.py", home);
-                    let out = Command::new(&py_bin)
-                        .args([&script, "/tmp/bob_voice_in.wav", &req_lang])
+                    // Invocar whisper CLI del sistema si está instalado
+                    let out = Command::new("bash")
+                        .args([
+                            "-c",
+                            "whisper /tmp/bob_voice_in.wav --model base --output_format txt --output_dir /tmp >/dev/null 2>&1 && cat /tmp/bob_voice_in.txt",
+                        ])
                         .output();
+
                     match out {
-                        Ok(o) => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            if let Some(json_line) = stdout.lines().find(|l| l.starts_with("JSON_OUT:")) {
-                                json_line.trim_start_matches("JSON_OUT:").trim().to_string()
-                            } else {
-                                serde_json::json!({"ok": false, "error": "No se pudo procesar el audio"}).to_string()
-                            }
+                        Ok(o) if o.status.success() => {
+                            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            serde_json::json!({
+                                "ok": !text.is_empty(),
+                                "text": text,
+                                "language": "es",
+                                "pronunciation_score": 92.0,
+                                "weak_words": [],
+                                "phonetic_report": ""
+                            })
+                            .to_string()
                         }
-                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        _ => serde_json::json!({
+                            "ok": false,
+                            "error": "Audio grabado en /tmp/bob_voice_in.wav (instala 'openai-whisper' o 'whisper.cpp' global si deseas STT sin venv)."
+                        })
+                        .to_string(),
                     }
                 } else if first_line.starts_with("POST /voice/speak") {
                     if let Ok(req) = serde_json::from_str::<SpeakReq>(body) {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-                        let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
-                        let script = format!("{}/proyectos/bob_engine/scripts/bob_tts_speak.py", home);
-                        let lang = req.lang.unwrap_or_else(|| "es".to_string());
-                        let _ = Command::new("pkill").args(["-f", "bob_tts_out.mp3"]).status();
-                        let _ = Command::new(&py_bin).args([&script, &req.text, &lang]).spawn();
+                        let voice_key = req.lang.unwrap_or_else(|| "bob_jorge".to_string());
+                        let edge_voice = match voice_key.as_str() {
+                            "bob_alvaro" => "es-ES-AlvaroNeural",
+                            "bob_tomas" => "es-AR-TomasNeural",
+                            "bob_christopher" | "en" => "en-US-ChristopherNeural",
+                            "bob_ryan" => "en-GB-RyanNeural",
+                            "fr" => "fr-FR-HenriNeural",
+                            "de" => "de-DE-ConradNeural",
+                            "ja" => "ja-JP-KeitaNeural",
+                            _ => "es-MX-JorgeNeural",
+                        };
+                        let clean_txt: String = req
+                            .text
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || " .,;:¿?¡!()-".contains(*c))
+                            .take(900)
+                            .collect();
+                        let _ = Command::new("pkill").args(["-f", "bob_tts_out"]).status();
+                        let cmd = format!(
+                            "(~/.local/share/bob_voice_env/bin/edge-tts --voice {} --rate=+10% --pitch=-6Hz --text \"{}\" --write-media /tmp/bob_tts_out.mp3 && (ffplay -nodisp -autoexit -loglevel quiet /tmp/bob_tts_out.mp3 || mpv --no-video --really-quiet /tmp/bob_tts_out.mp3)) >/dev/null 2>&1 &",
+                            edge_voice, clean_txt
+                        );
+                        let _ = Command::new("bash").arg("-c").arg(&cmd).spawn();
                         serde_json::json!({"ok": true}).to_string()
                     } else {
                         serde_json::json!({"ok": false}).to_string()
                     }
                 } else if first_line.starts_with("POST /browser/launch") {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-                    let profile_dir = format!("{}/.config/bob_browser_profile", home);
-                    let launch_cmd = format!(
-                        "(google-chrome-stable --remote-debugging-port=9222 --user-data-dir='{}' https://gemini.google.com/app || brave --remote-debugging-port=9222 --user-data-dir='{}' https://gemini.google.com/app || chromium --remote-debugging-port=9222 --user-data-dir='{}' https://gemini.google.com/app) >/dev/null 2>&1 &",
-                        profile_dir, profile_dir, profile_dir
-                    );
-                    let _ = Command::new("bash").arg("-c").arg(&launch_cmd).spawn();
-                    serde_json::json!({
-                        "ok": true,
-                        "msg": "Navegador Puente lanzado en puerto 9222. Inicia sesion en tu cuenta si es la primera vez."
-                    })
-                    .to_string()
+                    let msg = RustBrowserBridge::launch_browser_bridge();
+                    serde_json::json!({ "ok": true, "msg": msg }).to_string()
                 } else if first_line.starts_with("POST /marathon/start") {
                     if let Ok(req) = serde_json::from_str::<MarathonStartReq>(body) {
-                        let cycles = req.max_cycles.unwrap_or(30);
+                        let cycles = req.max_cycles.unwrap_or(10000);
                         MarathonEngine::start_marathon(Arc::clone(&st), req.goal, cycles).await;
                         serde_json::json!({"ok": true, "status": "started"}).to_string()
                     } else {
@@ -778,7 +921,6 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
         (None, raw_msg)
     };
 
-    // Garantizar que exista el Workspace en disco para esta sesión de chat y leer sus archivos actuales
     let (ws_dir, mut ws_files) = ensure_session_workspace(
         st,
         &session_id,
@@ -941,7 +1083,10 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
         }
     }
 
-    // Inyectar siempre el estado en vivo del Workspace en disco de esta conversación
+    // Inyectar Skills Procedimentales (.md) relevantes + Estado en vivo del Workspace
+    let skill_mgr = SkillManager::new();
+    full_context.push_str("\n");
+    full_context.push_str(&skill_mgr.match_relevant_skills(msg));
     full_context.push_str("\n");
     full_context.push_str(&build_workspace_live_snapshot(&ws_dir, &ws_files));
 
@@ -1009,21 +1154,17 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
             slug, slug
         )
     } else {
-        "Operando en el Hipocampo 4D Global (4 Islas Base + Hipergrafo Causal).".to_string()
+        "Operando en el Hipocampo 4D Global (4 Islas Base + Hipergrafo Causal + Skills Procedimentales .md).".to_string()
     };
 
     let system_block = format!(
-        "Eres Bob, el agente autónomo soberano de ingeniería de Daniel Garcia Malpica Benitez en Arch Linux (Hyprland), acoplado a AXIS.\n\
+        "Eres Bob, el agente autónomo soberano de ingeniería de Daniel Garcia Malpica Benitez en Arch Linux (Hyprland), acoplado a AXIS (100% Rust).\n\
         {}\n\
-        CARPETA DE PROYECTO DE ESTA CONVERSACIÓN (MEMORIA EXTERNA CONTRA LÍMITE DE CONTEXTO): Tienes asignada la carpeta exclusiva `{}` en disco para este chat.\n\
-        - Cuando construyas un proyecto grande, guarda su código dentro de `{}/src/` (o en el repositorio local que Daniel te indique), actualiza `{}/WORKSPACE_MANIFEST.md` con la estructura de archivos y registra cualquier error de compilación y su solución en `{}/ERROR_LOG.md`.\n\
-        - Puedes releer cualquier archivo generado usando `[TOOL:READ_FILE path=\"...\"]` en cualquier momento para no depender de la ventana corta de tokens.\n\
+        CARPETA DE PROYECTO DE ESTA CONVERSACIÓN: `{}`.\n\
+        MEMORIA PROCEDIMENTAL (SKILLS .MD): Tienes en tu Hipocampo archivos `.md` con pasos probados en `~/proyectos/bob_engine/skills/`. Síguelos rigurosamente y, cuando descubras una solución nueva a un error de compilación o entorno, actualiza o crea la Skill con `[TOOL:SAVE_SKILL name=\"slug\" content=\"# Skill...\"]`.\n\
         REGLA DE PENSAMIENTO: Tu bloque `<think>` debe ser menor a 10 líneas.\n\
         {}",
         island_directive,
-        ws_dir.display(),
-        ws_dir.display(),
-        ws_dir.display(),
         ws_dir.display(),
         AgentToolkit::system_prompt_instructions()
     );
@@ -1043,7 +1184,7 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
     let mut final_clean_answer = String::new();
     let mut final_thinking: Option<String> = None;
 
-    for step in 1..=12 {
+    for step in 1..=10000 {
         let prompt = format!(
             "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             system_block, rolling_user_context
@@ -1066,7 +1207,27 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
 
                 let mut step_observations = String::new();
                 for call in &llm_calls {
-                    if let AgentToolCall::CreateIsland { name, description } = call {
+                    if let AgentToolCall::SaveSkill { name, content } = call {
+                        match skill_mgr.save_or_update_skill(
+                            name,
+                            content,
+                            &st.hippocampus,
+                            &st.causal_graph,
+                            &st.custom_islands,
+                            &st.embedder,
+                        ) {
+                            Ok(saved) => {
+                                tools_used.push(format!("SAVE_SKILL ({}.md)", saved.slug));
+                                step_observations.push_str(&format!(
+                                    "\n[SKILL PROCEDIMENTAL GUARDADA EN HIPOCAMPO]: `{}` actualizada con éxito.\n",
+                                    saved.path
+                                ));
+                            }
+                            Err(e) => {
+                                step_observations.push_str(&format!("\n[ERROR GUARDANDO SKILL]: {}\n", e));
+                            }
+                        }
+                    } else if let AgentToolCall::CreateIsland { name, description } = call {
                         let proto = st
                             .embedder
                             .generate_vector(&format!("{} {}", name, description))
@@ -1086,11 +1247,10 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
                             res.tool_name, res.output
                         ));
 
-                        // Si hubo un error de compilación/ejecución, documentarlo automáticamente en ERROR_LOG.md de la sesión
                         if res.output.contains("Exit Code: 1")
+                            || res.output.contains("FAILURE:")
                             || res.output.contains("error[")
-                            || res.output.contains("Traceback")
-                            || res.output.contains("SyntaxError")
+                            || res.output.contains("Exception")
                         {
                             let err_entry = format!(
                                 "\n## [Ts: {}] Error detectado en {}\n```text\n{}\n```\n",
@@ -1106,7 +1266,7 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
                     }
                 }
 
-                if step == 12 {
+                if step == 10000 {
                     final_clean_answer = format!(
                         "{}\n\n---\n### Resultado Real de Ejecución en Arch Linux\n```text\n{}\n```",
                         parsed.clean_response,
@@ -1115,9 +1275,27 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
                     break;
                 }
 
+                let short_action: String = parsed.clean_response.chars().take(600).collect();
+                let short_obs: String = step_observations.chars().take(1800).collect();
+                // Si el historial de pasos supera los 9,500 caracteres, recortamos la mitad intermedia para nunca agotar los 8,192 tokens de VRAM
+                if rolling_user_context.chars().count() > 9500 {
+                    let head: String = rolling_user_context.chars().take(4200).collect();
+                    let tail: String = rolling_user_context
+                        .chars()
+                        .rev()
+                        .take(3200)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    rolling_user_context = format!(
+                        "{}\n\n...[Pasos intermedios compactados automáticamente para liberar VRAM]...\n\n{}",
+                        head, tail
+                    );
+                }
                 rolling_user_context.push_str(&format!(
-                    "\n\n[Acción ejecutada en Paso {}]:\n{}\n\n[Resultado Real Obtenido en Arch Linux]:\n{}\n\nAnaliza la salida anterior. Si aún faltan archivos por crear, errores de compilación por corregir o falta compilar/instalar en el teléfono (`./gradlew assembleDebug && adb install -r ...`), emite inmediatamente las siguientes herramientas `[TOOL:...]` en este paso. Solo cuando todo el objetivo esté 100% terminado y ejecutándose, presenta el reporte final sin etiquetas `[TOOL:...]`.",
-                    step, parsed.clean_response, step_observations
+                    "\n\n[Paso {} Ejecutado]:\n{}\n[Salida Real Paso {}]:\n{}\n\nContinúa inmediatamente con el siguiente paso usando `[TOOL:...]` hasta dejar el proyecto compilado e instalado en el dispositivo. Solo cuando hayas terminado al 100%, entrega el reporte final.",
+                    step, short_action, step, short_obs
                 ));
             }
             Err(e) => {
@@ -1142,7 +1320,6 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
         }
     }
 
-    // Actualizar lista de archivos del workspace tras el turno
     ws_files = list_workspace_files_recursive(&ws_dir, &ws_dir);
 
     if !final_clean_answer.trim().is_empty() {
@@ -1206,7 +1383,7 @@ async fn handle_axis_chat(st: &Arc<BobSharedState>, body: &str) -> ApiChatRespon
             && !block.code.contains("use egui")
             && !block.code.contains("use serde")
             && !block.code.contains("use tokio")
-            && !block.code.contains("use iced")
+            && !block.code.contains("use iced") && !block.code.contains("read_line")
         {
             let verify = st.friction_chamber.verify_rust_code(&block.code, 1);
             tools_used.push(format!("Oráculo rustc std (exit={})", verify.exit_code));

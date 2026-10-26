@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub enum AgentToolCall {
@@ -16,6 +16,8 @@ pub enum AgentToolCall {
     AskGemini { query: String },
     BrowserInspect,
     BrowserClick { text: String },
+    ReadSkill { name: String },
+    SaveSkill { name: String, content: String },
 }
 
 pub struct ToolExecutionResult {
@@ -28,18 +30,25 @@ pub struct AgentToolkit;
 
 impl AgentToolkit {
     pub fn system_prompt_instructions() -> &'static str {
-        "Herramientas disponibles en Arch Linux:\n\
+        "Herramientas disponibles en Arch Linux (100% Rust Nativo):\n\
+        - Para CREAR O SOBRESCRIBIR ARCHIVOS MULTILÍNEA (SIN ESCAPAR COMILLAS NI SALTOS DE LÍNEA), usa SIEMPRE este formato exacto con bloque de código debajo:\n\
+          [TOOL:WRITE_FILE path=\"/ruta/exacta/archivo.rs\"]\n\
+          ```rust\n\
+          // escribe aquí el código completo multilínea tal cual, sin usar base64 ni escapar nada\n\
+          ```\n\
+        - [TOOL:EXEC_CMD cmd=\"comando\"] -> Ejecuta un comando bash/cargo/gradle/adb en Arch Linux.\n\
+          * IMPORTANTE PARA EJECUTAR JUEGOS O APPS EN LA PC DE DANIEL: Si creas un juego interactivo de terminal (que lee `stdin`), NO lo ejecutes en seco porque `stdin` está cerrado en background; lánzalo abriendo una ventana visible en Hyprland con: `[TOOL:EXEC_CMD cmd=\"(kitty -e /ruta/binario || alacritty -e /ruta/binario || foot /ruta/binario || xterm -e /ruta/binario) >/dev/null 2>&1 &\"]`. Si es una app GUI (egui/eframe/gtk), lánzala en background con `/ruta/binario >/dev/null 2>&1 &`.\n\
         - [TOOL:SYS_INFO] -> Estado en vivo de CPU Ryzen 9, RAM y GPU RTX 5060 Ti.\n\
         - [TOOL:LIST_DIR path=\"ruta\"] -> Lista archivos de un directorio local.\n\
         - [TOOL:READ_FILE path=\"ruta\"] -> Lee un archivo local.\n\
         - [TOOL:SEARCH_CODE path=\"ruta\" pattern=\"texto\"] -> Busca código en el proyecto.\n\
         - [TOOL:WEB_SEARCH query=\"consulta\"] -> Busca información actualizada en Internet.\n\
-        - [TOOL:EXEC_CMD cmd=\"comando\"] -> Ejecuta un comando o script bash/python en Arch Linux.\n\
-        - [TOOL:WRITE_FILE path=\"ruta\" content=\"texto\"] -> Crea o modifica un archivo en disco.\n\
         - [TOOL:CREATE_ISLAND name=\"nombre\" desc=\"descripción\"] -> Crea una Isla de Vectores aislada en el Hipocampo 4D.\n\
-        - [TOOL:ASK_GEMINI query=\"pregunta técnica\"] -> Consulta directamente a Gemini en el navegador de Daniel (Sinapsis Quirón Segura).\n\
-        - [TOOL:BROWSER_INSPECT] -> Lee el contenido, preguntas y botones de la pestaña activa del navegador de Daniel (útil para quizes).\n\
-        - [TOOL:BROWSER_CLICK text=\"texto de la opción\"] -> Hace clic en una respuesta o botón dentro del navegador de Daniel."
+        - [TOOL:ASK_GEMINI query=\"pregunta técnica\"] -> Consulta directamente a Gemini en el navegador de Daniel vía CDP WebSocket en Rust.\n\
+        - [TOOL:BROWSER_INSPECT] -> Lee el contenido y botones de la pestaña activa del navegador.\n\
+        - [TOOL:BROWSER_CLICK text=\"texto\"] -> Hace clic en una opción o botón dentro del navegador.\n\
+        - [TOOL:READ_SKILL name=\"slug\"] -> Lee los pasos de una Skill procedimental (.md) de tu Hipocampo.\n\
+        - [TOOL:SAVE_SKILL name=\"slug\" content=\"# Skill...\"] -> Crea o actualiza una Skill (.md) en tu Hipocampo."
     }
 
     pub fn detect_island_creation_intent(user_input: &str) -> Option<(String, String)> {
@@ -192,6 +201,10 @@ impl AgentToolkit {
             .to_string()
     }
 
+    /// Parser robusto de herramientas que soporta:
+    /// 1) Formato de bloque Markdown debajo de `[TOOL:WRITE_FILE path="..."]` (sin escapar nada, nunca se corta en `]`)
+    /// 2) Formato con etiqueta de cierre `[/TOOL]`
+    /// 3) Formato inline `content="..."` o `cmd="..."` respetando corchetes internos (`#[allow(...)]`, `[0,1,2]`)
     pub fn parse_tool_calls(response: &str) -> Vec<AgentToolCall> {
         let mut calls = Vec::new();
         let parts: Vec<&str> = response.split("[TOOL:").collect();
@@ -210,34 +223,95 @@ impl AgentToolkit {
                 continue;
             }
 
-            let Some(end_tag) = Self::find_closing_tool_bracket(trimmed) else {
+            if trimmed.starts_with("WRITE_FILE") {
+                if let Some(path) = Self::extract_simple_attr(trimmed, "path") {
+                    // Caso A: WRITE_FILE sin atributo content=, seguido de un bloque ```...``` o [/TOOL]
+                    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+                    let header_line = &trimmed[..first_line_end];
+
+                    if !header_line.contains("content=\"") {
+                        let after_header = &trimmed[first_line_end..];
+                        if let Some(fenced) = Self::extract_first_fenced_block(after_header) {
+                            calls.push(AgentToolCall::WriteFile {
+                                path,
+                                content: fenced,
+                            });
+                            continue;
+                        } else if let Some(end_close) = after_header.find("[/TOOL]") {
+                            let body = after_header[..end_close].trim().to_string();
+                            calls.push(AgentToolCall::WriteFile {
+                                path,
+                                content: body,
+                            });
+                            continue;
+                        }
+                    }
+
+                    // Caso B: WRITE_FILE con atributo content="..." (puede ser multilínea con #[allow] o arreglos)
+                    if let Some(content_pos) = trimmed.find("content=\"") {
+                        let after_content = &trimmed[content_pos + 9..];
+                        let content_extracted = Self::extract_until_closing_quote_bracket(after_content);
+                        calls.push(AgentToolCall::WriteFile {
+                            path,
+                            content: content_extracted,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            if trimmed.starts_with("EXEC_CMD") {
+                let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+                let header_line = &trimmed[..first_line_end];
+                if !header_line.contains("cmd=\"") {
+                    let after_header = &trimmed[first_line_end..];
+                    if let Some(fenced) = Self::extract_first_fenced_block(after_header) {
+                        calls.push(AgentToolCall::ExecCmd { cmd: fenced });
+                        continue;
+                    }
+                }
+                if let Some(cmd_pos) = trimmed.find("cmd=\"") {
+                    let after_cmd = &trimmed[cmd_pos + 5..];
+                    let clean_cmd = Self::extract_until_closing_quote_bracket(after_cmd);
+                    if !clean_cmd.trim().is_empty() {
+                        calls.push(AgentToolCall::ExecCmd { cmd: clean_cmd });
+                    }
+                    continue;
+                }
+            }
+
+            if trimmed.starts_with("SAVE_SKILL") {
+                if let Some(name) = Self::extract_simple_attr(trimmed, "name") {
+                    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+                    let header_line = &trimmed[..first_line_end];
+                    if !header_line.contains("content=\"") {
+                        let after_header = &trimmed[first_line_end..];
+                        if let Some(fenced) = Self::extract_first_fenced_block(after_header) {
+                            calls.push(AgentToolCall::SaveSkill {
+                                name,
+                                content: fenced,
+                            });
+                            continue;
+                        }
+                    }
+                    if let Some(c_pos) = trimmed.find("content=\"") {
+                        let after_c = &trimmed[c_pos + 9..];
+                        let clean_c = Self::extract_until_closing_quote_bracket(after_c);
+                        calls.push(AgentToolCall::SaveSkill {
+                            name,
+                            content: clean_c,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let Some(end_tag) = trimmed.find(']') else {
                 continue;
             };
             let inside = &trimmed[..end_tag];
 
-            if inside.starts_with("EXEC_CMD") {
-                if let Some(cmd_pos) = inside.find("cmd=\"") {
-                    let cmd_body = &inside[cmd_pos + 5..];
-                    let clean_cmd = cmd_body.strip_suffix('"').unwrap_or(cmd_body).to_string();
-                    if !clean_cmd.trim().is_empty() {
-                        calls.push(AgentToolCall::ExecCmd { cmd: clean_cmd });
-                    }
-                }
-            } else if inside.starts_with("WRITE_FILE") {
-                if let Some(path) = Self::extract_simple_attr(inside, "path") {
-                    if let Some(content_pos) = inside.find("content=\"") {
-                        let content_body = &inside[content_pos + 9..];
-                        let clean_content = content_body
-                            .strip_suffix('"')
-                            .unwrap_or(content_body)
-                            .to_string();
-                        calls.push(AgentToolCall::WriteFile {
-                            path,
-                            content: clean_content,
-                        });
-                    }
-                }
-            } else if inside.starts_with("CREATE_ISLAND") {
+            if inside.starts_with("CREATE_ISLAND") {
                 if let Some(name) = Self::extract_simple_attr(inside, "name") {
                     let description = Self::extract_simple_attr(inside, "desc")
                         .unwrap_or_else(|| "Isla cortical especializada".to_string());
@@ -267,26 +341,53 @@ impl AgentToolkit {
                 if let Some(text) = Self::extract_simple_attr(inside, "text") {
                     calls.push(AgentToolCall::BrowserClick { text });
                 }
+            } else if inside.starts_with("READ_SKILL") {
+                if let Some(name) = Self::extract_simple_attr(inside, "name") {
+                    calls.push(AgentToolCall::ReadSkill { name });
+                }
             }
         }
 
         calls
     }
 
-    fn find_closing_tool_bracket(segment: &str) -> Option<usize> {
-        let mut last_candidate = None;
-        let bytes = segment.as_bytes();
+    /// Extrae el primer bloque ```...``` que aparece inmediatamente después de `[TOOL:WRITE_FILE path="..."]`
+    fn extract_first_fenced_block(s: &str) -> Option<String> {
+        let start_fence = s.find("```")?;
+        let after_fence = &s[start_fence + 3..];
+        let first_nl = after_fence.find('\n')?;
+        let code_body = &after_fence[first_nl + 1..];
+        let end_fence = code_body.find("```")?;
+        Some(code_body[..end_fence].to_string())
+    }
+
+    /// Extrae el cuerpo de `content="..."` o `cmd="..."` buscando la secuencia real de cierre `"]` no escapada (`\"`)
+    /// sin confundirse jamás con corchetes sueltos `]` como `#![allow(unused_variables)]` o `[0, 1, 2]`.
+    fn extract_until_closing_quote_bracket(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut last_valid_close = None;
+
         for i in 0..bytes.len().saturating_sub(1) {
             if bytes[i] == b'"' && bytes[i + 1] == b']' {
-                let after = &segment[i + 2..];
-                if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
-                    last_candidate = Some(i + 1);
-                } else if last_candidate.is_none() {
-                    last_candidate = Some(i + 1);
+                let is_escaped = i > 0 && bytes[i - 1] == b'\\';
+                if !is_escaped {
+                    let after = &s[i + 2..];
+                    if after.is_empty()
+                        || after.starts_with('\n')
+                        || after.starts_with('\r')
+                        || after.trim_start().starts_with("[TOOL:")
+                    {
+                        return s[..i].to_string();
+                    }
+                    last_valid_close = Some(i);
                 }
             }
         }
-        last_candidate.or_else(|| segment.find(']'))
+
+        if let Some(idx) = last_valid_close {
+            return s[..idx].to_string();
+        }
+        s.trim_end_matches(']').trim_end_matches('"').to_string()
     }
 
     fn extract_simple_attr(input: &str, key: &str) -> Option<String> {
@@ -311,7 +412,7 @@ impl AgentToolkit {
             },
             AgentToolCall::ReadFile { path } => ToolExecutionResult {
                 tool_name: "READ_FILE",
-                output: Self::read_file_safe(path, 120),
+                output: Self::read_file_safe(path, 160),
                 approved: true,
             },
             AgentToolCall::SearchCode { path, pattern } => ToolExecutionResult {
@@ -331,17 +432,34 @@ impl AgentToolkit {
             },
             AgentToolCall::AskGemini { query } => ToolExecutionResult {
                 tool_name: "ASK_GEMINI",
-                output: Self::run_browser_script("ask_gemini", query),
+                output: crate::browser_cdp::RustBrowserBridge::ask_gemini_native(query),
                 approved: true,
             },
             AgentToolCall::BrowserInspect => ToolExecutionResult {
                 tool_name: "BROWSER_INSPECT",
-                output: Self::run_browser_script("inspect", ""),
+                output: crate::browser_cdp::RustBrowserBridge::inspect_active_tab(),
                 approved: true,
             },
             AgentToolCall::BrowserClick { text } => ToolExecutionResult {
                 tool_name: "BROWSER_CLICK",
-                output: Self::run_browser_script("click", text),
+                output: crate::browser_cdp::RustBrowserBridge::click_element_by_text(text),
+                approved: true,
+            },
+            AgentToolCall::ReadSkill { name } => {
+                let mgr = crate::skills::SkillManager::new();
+                let out = mgr
+                    .read_skill(name)
+                    .map(|s| format!("Contenido de Skill `{}.md`:\n{}", s.slug, s.content))
+                    .unwrap_or_else(|| format!("La Skill `{}` aún no existe.", name));
+                ToolExecutionResult {
+                    tool_name: "READ_SKILL",
+                    output: out,
+                    approved: true,
+                }
+            }
+            AgentToolCall::SaveSkill { name, .. } => ToolExecutionResult {
+                tool_name: "SAVE_SKILL",
+                output: format!("Skill `{}` lista para persistencia en Hipocampo.", name),
                 approved: true,
             },
             AgentToolCall::WriteFile { path, content } => {
@@ -355,7 +473,7 @@ impl AgentToolkit {
                 let mut choice = String::new();
                 let _ = io::stdin().read_line(&mut choice);
                 if matches!(choice.trim().to_uppercase().as_str(), "Y" | "YES" | "SI" | "SÍ") {
-                    let unescaped = content.replace("\\n", "\n");
+                    let unescaped = Self::unescape_code_content(content);
                     match fs::write(path, unescaped) {
                         Ok(_) => ToolExecutionResult {
                             tool_name: "WRITE_FILE",
@@ -387,7 +505,12 @@ impl AgentToolkit {
                 let mut choice = String::new();
                 let _ = io::stdin().read_line(&mut choice);
                 if matches!(choice.trim().to_uppercase().as_str(), "Y" | "YES" | "SI" | "SÍ") {
-                    match Command::new("bash").arg("-c").arg(cmd).output() {
+                    match Command::new("bash")
+                        .arg("-c")
+                        .arg(cmd)
+                        .stdin(Stdio::null())
+                        .output()
+                    {
                         Ok(out) => {
                             let stdout = String::from_utf8_lossy(&out.stdout);
                             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -420,6 +543,19 @@ impl AgentToolkit {
         }
     }
 
+    fn unescape_code_content(content: &str) -> String {
+        // Si ya viene con saltos de línea reales (bloque fenced ```), solo limpiamos escapes básicos si el LLM escapó comillas
+        if content.contains('\n') {
+            content.replace("\\\\:", "\\:")
+        } else {
+            content
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\:", "\\:")
+        }
+    }
+
     pub fn execute_tool_autonomous(call: &AgentToolCall) -> ToolExecutionResult {
         match call {
             AgentToolCall::WriteFile { path, content } => {
@@ -430,14 +566,7 @@ impl AgentToolkit {
                         approved: false,
                     };
                 }
-                let unescaped = if content.contains('\n') {
-                    content.clone()
-                } else {
-                    content
-                        .replace("\\n", "\n")
-                        .replace("\\t", "\t")
-                        .replace("\\\"", "\"")
-                };
+                let unescaped = Self::unescape_code_content(content);
                 if let Some(parent) = Path::new(path).parent() {
                     if !parent.as_os_str().is_empty() {
                         let _ = fs::create_dir_all(parent);
@@ -446,7 +575,12 @@ impl AgentToolkit {
                 match fs::write(path, &unescaped) {
                     Ok(_) => ToolExecutionResult {
                         tool_name: "WRITE_FILE",
-                        output: format!("Archivo `{}` escrito en disco ({} bytes).", path, unescaped.len()),
+                        output: format!(
+                            "Archivo `{}` escrito exitosamente en disco ({} bytes, {} líneas).",
+                            path,
+                            unescaped.len(),
+                            unescaped.lines().count()
+                        ),
                         approved: true,
                     },
                     Err(e) => ToolExecutionResult {
@@ -457,7 +591,15 @@ impl AgentToolkit {
                 }
             }
             AgentToolCall::ExecCmd { cmd } => {
-                let forbidden = ["rm -rf /", "mkfs", "dd if=", ":(){", "chmod -R 777 /", "shutdown", "reboot"];
+                let forbidden = [
+                    "rm -rf /",
+                    "mkfs",
+                    "dd if=",
+                    ":(){",
+                    "chmod -R 777 /",
+                    "shutdown",
+                    "reboot",
+                ];
                 for pat in forbidden {
                     if cmd.contains(pat) {
                         return ToolExecutionResult {
@@ -468,36 +610,23 @@ impl AgentToolkit {
                     }
                 }
 
-                let is_heavy_build = cmd.contains("gradle")
-                    || cmd.contains("cargo")
-                    || cmd.contains("adb ")
-                    || cmd.contains("pacman")
-                    || cmd.contains("pnpm")
-                    || cmd.contains("npm")
-                    || cmd.contains("pip ");
-                let timeout_dur = if is_heavy_build { "120s" } else { "15s" };
                 let env_wrapped_cmd = format!(
-                    "export JAVA_HOME=/opt/android-studio/jbr; export ANDROID_HOME=$HOME/Android/Sdk; export PATH=$PATH:$ANDROID_HOME/platform-tools:$JAVA_HOME/bin; {}",
+                    "if [ -d /opt/android-studio/jbr ]; then export JAVA_HOME=/opt/android-studio/jbr; elif [ -d /usr/lib/jvm/java-21-openjdk ]; then export JAVA_HOME=/usr/lib/jvm/java-21-openjdk; fi; export ANDROID_HOME=$HOME/Android/Sdk; export PATH=$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH; {}",
                     cmd
                 );
 
-                match Command::new("timeout")
-                    .args([timeout_dur, "bash", "-c", &env_wrapped_cmd])
+                match Command::new("bash")
+                    .args(["-c", &env_wrapped_cmd])
+                    .stdin(Stdio::null())
                     .output()
                 {
                     Ok(out) => {
                         let code = out.status.code().unwrap_or(0);
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
-                        let status_note = if code == 124 {
-                            "Ventana gráfica / proceso interactivo ejecutado en Arch Linux durante 10s sin errores (cerrado automáticamente tras prueba)."
-                        } else {
-                            "Ejecución de terminal completada."
-                        };
                         let combined = format!(
-                            "Exit Code: {} ({})\nSTDOUT:\n{}\nSTDERR:\n{}",
+                            "Exit Code: {} (Ejecución de terminal completada.)\nSTDOUT:\n{}\nSTDERR:\n{}",
                             code,
-                            status_note,
                             stdout.trim(),
                             stderr.trim()
                         );
@@ -515,26 +644,6 @@ impl AgentToolkit {
                 }
             }
             other => Self::execute_tool(other),
-        }
-    }
-
-    pub fn run_browser_script(mode: &str, arg: &str) -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/daniel".to_string());
-        let py_bin = format!("{}/proyectos/bob_engine/.venv/bin/python3", home);
-        let script = format!("{}/proyectos/bob_engine/scripts/bob_browser_bridge.py", home);
-        let python_cmd = if Path::new(&py_bin).exists() {
-            py_bin
-        } else {
-            "python3".to_string()
-        };
-
-        match Command::new(&python_cmd).args([&script, mode, arg]).output() {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string()
-            }
-            Err(e) => format!("Error ejecutando puente de navegador: {}", e),
         }
     }
 

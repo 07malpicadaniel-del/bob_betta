@@ -28,7 +28,7 @@ impl Default for CortexConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8085,
-            n_predict: 2048,
+            n_predict: 4096,
             temperature: 0.2,
             slot_id: 0,
             n_gpu_layers: 99,
